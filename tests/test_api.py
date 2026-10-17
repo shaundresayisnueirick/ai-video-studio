@@ -656,6 +656,88 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(req.status, 200)
         self.assertEqual(json.loads(req.response)["draft"]["alternatives"][0]["title"], "Kisah kecil")
         adapter.assert_called_once()
+
+    def test_gemini_status_exposes_only_key_configuration(self):
+        req = Request("GET", "/api/ai/gemini/status")
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": ""}):
+            req.do_GET()
+        self.assertEqual(req.status, 200)
+        self.assertEqual(json.loads(req.response), {"configured": False})
+
+    def test_gemini_story_requires_environment_key_without_calling_api(self):
+        req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Kisah hujan"}).encode())
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": ""}), patch.object(app.urllib.request, "urlopen") as urlopen:
+            req.do_POST()
+        self.assertEqual(req.status, 503)
+        error = json.loads(req.response)["error"]
+        self.assertIn("GEMINI_API_KEY", error)
+        self.assertNotIn("fake-test-key", error)
+        urlopen.assert_not_called()
+
+    def test_gemini_story_valid_json_uses_fixed_model_and_secret_header(self):
+        story = {"alternatives":[{"title":"Kisah senja", "scenes":[{"title":"Pembuka", "visual":"Langit jingga"}]}]}
+        response_body = {"candidates":[{"content":{"parts":[{"text":json.dumps(story, ensure_ascii=False)}]}}]}
+        req = Request("POST", "/api/ai/story", json.dumps({
+            "provider":"gemini", "idea":"Senja di desa", "goal":"Cerita", "duration":"30 detik", "style":"Hangat",
+        }).encode())
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY":"fake-test-key"}), patch.object(
+            app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(response_body).encode()),
+        ) as urlopen:
+            req.do_POST()
+        self.assertEqual(req.status, 200)
+        draft = json.loads(req.response)["draft"]["alternatives"][0]
+        self.assertEqual(draft["title"], "Kisah senja")
+        self.assertEqual(draft["scenes"][0]["visual"], "Langit jingga")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, app.GEMINI_API_URL)
+        self.assertEqual(request.get_header("X-goog-api-key"), "fake-test-key")
+        request_text = json.loads(request.data)["contents"][0]["parts"][0]["text"]
+        self.assertIn("Jenis video: Cerita", request_text)
+        self.assertIn("Ide pengguna: Senja di desa", request_text)
+
+    def test_gemini_story_rejects_invalid_model_json(self):
+        response_body = {"candidates":[{"content":{"parts":[{"text":"bukan json"}]}}]}
+        req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Ide"}).encode())
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY":"fake-test-key"}), patch.object(
+            app.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(response_body).encode()),
+        ):
+            req.do_POST()
+        self.assertEqual(req.status, 502)
+        self.assertIn("bukan JSON", json.loads(req.response)["error"])
+
+    def test_gemini_story_timeout_is_reported_without_fallback(self):
+        req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Ide"}).encode())
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY":"fake-test-key"}), patch.object(
+            app.urllib.request, "urlopen", side_effect=TimeoutError("simulated timeout"),
+        ) as urlopen:
+            req.do_POST()
+        self.assertEqual(req.status, 504)
+        self.assertIn("batas waktu", json.loads(req.response)["error"])
+        urlopen.assert_called_once()
+
+    def test_gemini_story_api_error_is_reported_without_fallback(self):
+        req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Ide"}).encode())
+        api_error = app.urllib.error.HTTPError(app.GEMINI_API_URL, 403, "forbidden", {}, io.BytesIO(b"private provider body"))
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY":"fake-test-key"}), patch.object(
+            app.urllib.request, "urlopen", side_effect=api_error,
+        ):
+            req.do_POST()
+        self.assertEqual(req.status, 502)
+        error = json.loads(req.response)["error"]
+        self.assertIn("menolak autentikasi", error)
+        self.assertNotIn("private provider body", error)
+        self.assertNotIn("fake-test-key", error)
+
+    def test_gemini_story_quota_error_is_reported_without_fallback(self):
+        req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Ide"}).encode())
+        api_error = app.urllib.error.HTTPError(app.GEMINI_API_URL, 429, "quota", {}, io.BytesIO(b"quota details"))
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY":"fake-test-key"}), patch.object(
+            app.urllib.request, "urlopen", side_effect=api_error,
+        ) as urlopen:
+            req.do_POST()
+        self.assertEqual(req.status, 429)
+        self.assertIn("kuota Gemini tercapai", json.loads(req.response)["error"])
+        urlopen.assert_called_once()
     def test_ai_story_endpoint_rejects_empty_idea(self):
         req = Request("POST", "/api/ai/story", json.dumps({"idea":" "}).encode())
         req.do_POST()

@@ -511,3 +511,53 @@ test('changing a checklist control updates only its scene and legacy JSON check 
   assert.equal(result.second.generated, true);
   assert.equal(result.second.collected, false);
 });
+
+test('Gemini provider is sent explicitly and draft stays unapplied until user confirmation', async () => {
+  const calls = [];
+  let approve = false;
+  const existing = project();
+  existing.idea = 'Cerita lama';
+  existing.data.entities = { characters: [], locations: [], products: [] };
+  existing.data.scenes = [{ id: 'old-scene', title: 'Adegan lama' }];
+  const { context, element } = appContext({
+    confirmImpl: () => approve,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/story') return response({ draft: { alternatives: [{
+        title: 'Cerita Gemini', logline: 'Arah cerita baru', message: 'Pesan baru',
+        scenes: [{ id: 'new-scene', title: 'Adegan baru', visual: 'Hujan reda' }],
+      }] } });
+      if (options?.method === 'PUT') return response(JSON.parse(options.body));
+      if (url === '/api/projects') return response([]);
+      return response({});
+    },
+  });
+  vm.runInContext(`current=${JSON.stringify(existing)};projects=[current];activeTab='idea'`, context);
+  element('#ai-provider').value = 'gemini';
+  element('#idea-input').value = 'Seseorang menemukan rumah setelah hujan';
+  element('#duration-input').value = '30 detik';
+  element('#style-input').value = 'Sinematik natural';
+
+  await vm.runInContext('requestAIDraft()', context);
+  const request = calls.find(call => call.url === '/api/ai/story');
+  const payload = JSON.parse(request.options.body);
+  assert.equal(payload.provider, 'gemini');
+  assert.equal(payload.idea, 'Seseorang menemukan rumah setelah hujan');
+  assert.equal('model' in payload, false);
+  assert.match(element('#ai-review-source').textContent, /GEMINI/);
+  assert.equal(vm.runInContext('current.data.scenes[0].id', context), 'old-scene');
+
+  await element('#apply-ai-draft').onclick();
+  assert.equal(calls.some(call => call.options?.method === 'PUT'), false);
+  assert.equal(vm.runInContext('current.data.scenes[0].id', context), 'old-scene');
+  assert.equal(vm.runInContext('activeTab', context), 'idea');
+
+  approve = true;
+  await element('#apply-ai-draft').onclick();
+  const save = calls.find(call => call.options?.method === 'PUT');
+  assert.ok(save, 'confirmed draft should be saved');
+  assert.equal(JSON.parse(save.options.body).data.scenes[0].id, 'new-scene');
+  assert.equal(vm.runInContext('current.data.scenes[0].id', context), 'new-scene');
+  assert.equal(vm.runInContext('activeTab', context), 'storyboard');
+  assert.match(element('#toast').textContent, /Gemini/);
+});

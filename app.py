@@ -9,6 +9,7 @@ import mimetypes
 import os
 import sqlite3
 import stat
+import socket
 import struct
 import uuid
 import urllib.request
@@ -24,6 +25,8 @@ MAX_JSON_BODY_BYTES = 1_000_000
 PRODUCTION_SCHEMA_VERSION = 1
 MAX_IMAGE_PIXELS = 80_000_000
 MAX_DECODED_IMAGE_BYTES = 128_000_000
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 DATA.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
 
@@ -438,11 +441,8 @@ def local_ollama_models():
         payload = json.loads(response.read(1_000_000))
     return [m.get("name") for m in payload.get("models", []) if m.get("name")]
 
-def make_local_story(idea, goal, duration, style, model):
-    models = local_ollama_models()
-    if model not in models:
-        raise ValueError("Pilih model yang terpasang di Ollama lokal.")
-    schema = {"alternatives": [{
+def story_schema_example():
+    return {"alternatives": [{
         "title": "judul alternatif", "logline": "cerita dalam satu kalimat", "concept": "ringkasan konsep",
         "audience": "target penonton", "message": "pesan utama", "opening": "pembuka",
         "conflict": "konflik", "development": "perkembangan", "ending": "penutup",
@@ -455,28 +455,18 @@ def make_local_story(idea, goal, duration, style, model):
             "dialogue": "dialog/narasi", "duration": "durasi target"
         }]
     }]}
-    prompt = (
+
+def story_prompt(idea, goal, duration, style):
+    return (
         "Buat tepat 3 alternatif konsep yang berbeda untuk ide video, masing-masing dengan 3 adegan ringkas. "
         "Berbahasa Indonesia, mudah diproduksi, dan jangan menambah fakta penting yang tidak didukung ide. "
         "Tulis keluaran HANYA sebagai JSON valid yang mengikuti struktur contoh ini: "
-        + json.dumps(schema, ensure_ascii=False)
+        + json.dumps(story_schema_example(), ensure_ascii=False)
         + f"\n\nJenis video: {goal}\nDurasi target: {duration}\nGaya visual: {style}\nIde pengguna: {idea}"
     )
-    body = json.dumps({
-        "model": model,
-        "stream": False,
-        "format": "json",
-        "messages": [
-            {"role": "system", "content": "Anda asisten produksi video. Buat draft yang bisa diedit, ringkas, realistis untuk klip pendek, dan berbahasa Indonesia."},
-            {"role": "user", "content": prompt},
-        ],
-        "options": {"temperature": 0.5, "num_predict": 3500},
-    }).encode()
-    request = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=180) as response:
-        result = json.loads(response.read(2_000_000))
-    draft = json.loads(result["message"]["content"])
-    alternatives = draft.get("alternatives")
+
+def normalize_story_draft(draft):
+    alternatives = draft.get("alternatives") if isinstance(draft, dict) else None
     if not isinstance(alternatives, list) or not alternatives:
         raise ValueError("Model belum menghasilkan alternatif cerita yang valid. Coba lagi atau gunakan kerangka manual.")
     normalized = []
@@ -499,6 +489,75 @@ def make_local_story(idea, goal, duration, style, model):
     if not normalized:
         raise ValueError("Model belum menghasilkan adegan valid. Coba lagi atau gunakan kerangka manual.")
     return {"alternatives": normalized}
+
+class GeminiProviderError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+def make_gemini_story(idea, goal, duration, style):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise GeminiProviderError(503, "GEMINI_API_KEY belum dikonfigurasi pada environment server. Gemini tidak dijalankan.")
+    body = json.dumps({
+        "contents": [{"parts": [{"text": story_prompt(idea, goal, duration, style)}]}],
+        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 3500},
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        GEMINI_API_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            raw = response.read(2_000_001)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise GeminiProviderError(429, "Batas permintaan atau kuota Gemini tercapai. Periksa kuota akun/API; tidak ada fallback otomatis.") from None
+        if exc.code in (401, 403):
+            raise GeminiProviderError(502, "Gemini menolak autentikasi atau akses API. Periksa GEMINI_API_KEY dan izin proyek.") from None
+        raise GeminiProviderError(502, f"Gemini API mengembalikan kesalahan HTTP {exc.code}. Tidak ada fallback otomatis.") from None
+    except (TimeoutError, socket.timeout):
+        raise GeminiProviderError(504, "Permintaan Gemini melewati batas waktu. Coba lagi nanti; tidak ada fallback otomatis.") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise GeminiProviderError(504, "Permintaan Gemini melewati batas waktu. Coba lagi nanti; tidak ada fallback otomatis.") from None
+        raise GeminiProviderError(502, "Gemini API tidak dapat dijangkau. Periksa koneksi; tidak ada fallback otomatis.") from None
+
+    if len(raw) > 2_000_000:
+        raise GeminiProviderError(502, "Respons Gemini terlalu besar untuk diproses.")
+    try:
+        payload = json.loads(raw)
+        parts = payload["candidates"][0]["content"]["parts"]
+        text = "".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str))
+        draft = json.loads(text)
+        return normalize_story_draft(draft)
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("Model belum menghasilkan"):
+            raise GeminiProviderError(502, "Respons Gemini tidak sesuai struktur cerita yang diharapkan.") from None
+        raise GeminiProviderError(502, "Respons Gemini kosong atau bukan JSON cerita yang valid.") from None
+
+def make_local_story(idea, goal, duration, style, model):
+    models = local_ollama_models()
+    if model not in models:
+        raise ValueError("Pilih model yang terpasang di Ollama lokal.")
+    prompt = story_prompt(idea, goal, duration, style)
+    body = json.dumps({
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": "Anda asisten produksi video. Buat draft yang bisa diedit, ringkas, realistis untuk klip pendek, dan berbahasa Indonesia."},
+            {"role": "user", "content": prompt},
+        ],
+        "options": {"temperature": 0.5, "num_predict": 3500},
+    }).encode()
+    request = urllib.request.Request("http://127.0.0.1:11434/api/chat", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=180) as response:
+        result = json.loads(response.read(2_000_000))
+    draft = json.loads(result["message"]["content"])
+    return normalize_story_draft(draft)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -539,6 +598,8 @@ class Handler(BaseHTTPRequestHandler):
         return payload
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/ai/gemini/status":
+            return self.send(200, json.dumps({"configured": bool(os.environ.get("GEMINI_API_KEY", "").strip())}))
         if path == "/api/ai/status":
             try:
                 models = local_ollama_models()
@@ -569,8 +630,19 @@ class Handler(BaseHTTPRequestHandler):
                 if body is None: return
                 idea = str(body.get("idea", "")).strip()
                 if not idea or len(idea) > 7000: return self.send(400, '{"error":"Isi ide (maks. 7.000 karakter) sebelum meminta draft."}')
-                draft = make_local_story(idea, str(body.get("goal", ""))[:100], str(body.get("duration", "1 menit"))[:50], str(body.get("style", ""))[:100], str(body.get("model", "")))
+                goal = str(body.get("goal", ""))[:100]
+                duration = str(body.get("duration", "1 menit"))[:50]
+                style = str(body.get("style", ""))[:100]
+                provider = str(body.get("provider", "ollama")).strip().lower()
+                if provider == "gemini":
+                    draft = make_gemini_story(idea, goal, duration, style)
+                elif provider == "ollama":
+                    draft = make_local_story(idea, goal, duration, style, str(body.get("model", "")))
+                else:
+                    return self.send(400, '{"error":"Provider AI tidak dikenal. Pilih Ollama atau Gemini."}')
                 return self.send(200, json.dumps({"draft": draft}, ensure_ascii=False))
+            except GeminiProviderError as exc:
+                return self.send(exc.status, json.dumps({"error": str(exc)}, ensure_ascii=False))
             except ValueError as exc:
                 return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
             except Exception:

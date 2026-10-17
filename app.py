@@ -510,7 +510,7 @@ def make_gemini_story(idea, goal, duration, style):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             raw = response.read(2_000_001)
     except urllib.error.HTTPError as exc:
         if exc.code == 429:

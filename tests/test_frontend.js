@@ -561,3 +561,94 @@ test('Gemini provider is sent explicitly and draft stays unapplied until user co
   assert.equal(vm.runInContext('activeTab', context), 'storyboard');
   assert.match(element('#toast').textContent, /Gemini/);
 });
+
+test('characters and locations get stable ids and manual entries survive a draft apply', async () => {
+  const { context } = appContext();
+  vm.runInContext(`current=${JSON.stringify(project('p1'))};current.data=normalizeProductionData({characters:[{name:'Lama',appearance:'x'}],locations:[{name:'Pasar'}]},current);`, context);
+  const firstIds = vm.runInContext('current.data.entities.characters.map(c=>c.id)', context);
+  assert.ok(firstIds[0].startsWith('char-'));
+  vm.runInContext('normalizeProductionData(current.data,current)', context);
+  assert.deepEqual(vm.runInContext('current.data.entities.characters.map(c=>c.id)', context), firstIds);
+  vm.runInContext(`current.data.entities.characters.push({id:'char-manual',name:'Rani',role:'tokoh utama',appearance:'ikal',source:'manual'});current.data.entities.locations.push({id:'loc-manual',name:'Kedai',description:'hangat',source:'manual'});aiDraft={alternatives:[{title:'Baru',characters:[{name:'Budi',appearance:'topi'}],locations:[{name:'Stasiun',description:'ramai'}],scenes:[{id:'x',title:'Awal',visual:'v'}]}]};aiDraftProvider='ollama';`, context);
+  await vm.runInContext('applyAIDraft()', context);
+  const names = vm.runInContext('current.data.entities.characters.map(c=>c.name)', context);
+  assert.deepEqual(names.sort(), ['Budi', 'Rani']);
+  assert.equal(vm.runInContext("current.data.entities.characters.find(c=>c.name==='Rani').id", context), 'char-manual');
+  assert.equal(vm.runInContext("current.data.entities.characters.find(c=>c.name==='Budi').source", context), 'ai');
+  assert.deepEqual(vm.runInContext('current.data.entities.locations.map(l=>l.name).sort()', context), ['Kedai', 'Stasiun']);
+});
+
+const linkedData = () => ({
+  projectBrief: {}, storyPlan: {}, assets: [], checks: {},
+  entities: {
+    characters: [{ id: 'char-a', name: 'Rani', role: 'tokoh utama', appearance: 'rambut ikal' }, { id: 'char-b', name: 'Budi', appearance: 'topi merah' }],
+    products: [],
+    locations: [{ id: 'loc-a', name: 'Kedai', description: 'lampu kuning' }, { id: 'loc-b', name: 'Pasar', description: 'ramai' }],
+  },
+  scenes: [
+    { id: 's1', title: 'Satu', action: 'Rani masuk', characterIds: ['char-a'], locationId: 'loc-a' },
+    { id: 's2', title: 'Dua', action: 'Budi keluar', characterIds: ['char-b'], locationId: '' },
+    { id: 's3', title: 'Tiga', action: 'Tanpa pilihan', characterIds: [], locationId: '' },
+  ],
+});
+
+test('selected character and location descriptions reach only the scene that uses them', () => {
+  const { context } = appContext();
+  context.linkedProject = { id: 'p1', title: 'Kopi', goal: 'Promosi', idea: '', platform: 'flow', data: linkedData() };
+  const out = vm.runInContext(`(()=>{const d=linkedProject.data,p=linkedProject,pl=platforms.flow;return{one:makePrompt(d.scenes[0],pl,d,p),two:makePrompt(d.scenes[1],pl,d,p),three:makePrompt(d.scenes[2],pl,d,p)}})()`, context);
+  assert.ok(out.one.includes('Rani (tokoh utama): rambut ikal'));
+  assert.ok(out.one.includes('Kedai: lampu kuning'));
+  assert.equal(out.one.includes('Budi'), false);
+  assert.equal(out.one.includes('Pasar'), false);
+  assert.ok(out.two.includes('Budi: topi merah'));
+  assert.equal(out.two.includes('Rani'), false);
+  assert.equal(out.two.includes('Kedai'), false);
+  assert.equal(out.three.includes('Karakter yang harus dipertahankan'), false);
+  assert.equal(out.three.includes('Lokasi yang harus dipertahankan'), false);
+});
+
+test('toggling scene links adds and removes ids without duplicates', () => {
+  const { context } = appContext();
+  const s = { id: 's1', characterIds: ['char-a'], locationId: '' };
+  vm.runInContext('setSceneEntity(scene,"characters","char-b",true);setSceneEntity(scene,"characters","char-b",true);setSceneEntity(scene,"characters","char-a",false);setSceneEntity(scene,"locations","loc-a",true)', Object.assign(context, { scene: s }));
+  assert.deepEqual(JSON.parse(JSON.stringify(s.characterIds)), ['char-b']);
+  assert.equal(s.locationId, 'loc-a');
+  vm.runInContext('setSceneEntity(scene,"locations","",true)', Object.assign(context, { scene: s }));
+  assert.equal(s.locationId, '');
+});
+
+test('removing a character or location clears only its references', () => {
+  const { context } = appContext();
+  context.removeProject = { data: linkedData() };
+  vm.runInContext('removeEntity(removeProject.data,"characters","char-a");removeEntity(removeProject.data,"locations","loc-a")', context);
+  const d = context.removeProject.data;
+  assert.deepEqual(d.scenes[0].characterIds, []);
+  assert.equal(d.scenes[0].locationId, '');
+  assert.deepEqual(d.scenes[1].characterIds, ['char-b']);
+  assert.deepEqual(d.entities.characters.map(c => c.id), ['char-b']);
+  assert.deepEqual(d.characters.map(c => c.id), ['char-b']);
+  assert.deepEqual(d.entities.locations.map(l => l.id), ['loc-b']);
+});
+
+test('links survive save and reopen and dangling references are pruned on load', () => {
+  const { context } = appContext();
+  const data = linkedData();
+  data.scenes[0].characterIds.push('char-missing');
+  data.scenes[0].locationId = 'loc-missing';
+  context.reopenProject = { id: 'p1', title: 'Kopi', goal: 'Promosi', idea: '', platform: 'flow', data: JSON.parse(JSON.stringify(data)) };
+  const reopened = vm.runInContext('normalizeProductionData(JSON.parse(JSON.stringify(reopenProject.data)),reopenProject).scenes', context);
+  assert.deepEqual(JSON.parse(JSON.stringify(reopened[0].characterIds)), ['char-a']);
+  assert.equal(reopened[0].locationId, '');
+  assert.deepEqual(JSON.parse(JSON.stringify(reopened[1].characterIds)), ['char-b']);
+});
+
+test('legacy project without character or location data opens and prompts as before', () => {
+  const { context } = appContext();
+  context.legacyProject = { id: 'p9', title: 'Lama', goal: 'Cerita', idea: '', platform: 'flow', data: { scenes: [{ id: 'old', title: 'Lama', action: 'Berjalan' }] } };
+  const result = vm.runInContext('(()=>{const d=normalizeProductionData(legacyProject.data,legacyProject);return{chars:d.entities.characters,locs:d.entities.locations,prompt:makePrompt(d.scenes[0],platforms.flow,d,legacyProject)}})()', context);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.chars)), []);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.locs)), []);
+  assert.equal(result.prompt.includes('Karakter yang harus dipertahankan'), false);
+  assert.equal(result.prompt.includes('Lokasi yang harus dipertahankan'), false);
+  assert.ok(result.prompt.includes('Aksi: Berjalan.'));
+});

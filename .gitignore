@@ -1,0 +1,29 @@
+data/
+__pycache__/
+tests/__pycache__/
+tests/tmp*/
+
+# Python cache and virtual environments
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Local application data
+data/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+tests/tmp*/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/

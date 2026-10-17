@@ -662,7 +662,7 @@ class ApiSmokeTests(unittest.TestCase):
         with patch.dict(app.os.environ, {"GEMINI_API_KEY": ""}):
             req.do_GET()
         self.assertEqual(req.status, 200)
-        self.assertEqual(json.loads(req.response), {"configured": False})
+        self.assertEqual(json.loads(req.response), {"configured": False, "source": None})
 
     def test_gemini_story_requires_environment_key_without_calling_api(self):
         req = Request("POST", "/api/ai/story", json.dumps({"provider":"gemini", "idea":"Kisah hujan"}).encode())
@@ -794,3 +794,53 @@ class ApiSmokeTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+class GeminiEnvFileTests(unittest.TestCase):
+    SECRET = "test-secret-value-123"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.tmp.cleanup)
+        self.env_path = Path(self.tmp.name) / ".env"
+
+    def test_env_file_fills_missing_key_and_ignores_comments_and_malformed_lines(self):
+        self.env_path.write_text("# GEMINI_API_KEY=ignored\nnot a pair\nexport GEMINI_API_KEY=\"%s\"\nOTHER_SETTING=ok\n" % self.SECRET, encoding="utf-8")
+        with patch.dict(app.os.environ, {}, clear=True):
+            app.load_env_file(self.env_path)
+            self.assertEqual(app.os.environ.get("GEMINI_API_KEY"), self.SECRET)
+            self.assertEqual(app.os.environ.get("OTHER_SETTING"), "ok")
+            self.assertNotIn("# GEMINI_API_KEY", app.os.environ)
+
+    def test_real_environment_value_wins_over_env_file(self):
+        self.env_path.write_text("GEMINI_API_KEY=%s\n" % self.SECRET, encoding="utf-8")
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": "from-environment"}, clear=True):
+            app.load_env_file(self.env_path)
+            self.assertEqual(app.os.environ["GEMINI_API_KEY"], "from-environment")
+
+    def test_empty_environment_value_does_not_block_env_file(self):
+        self.env_path.write_text("GEMINI_API_KEY=%s\n" % self.SECRET, encoding="utf-8")
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": "   "}, clear=True):
+            app.load_env_file(self.env_path)
+            self.assertEqual(app.os.environ["GEMINI_API_KEY"], self.SECRET)
+
+    def test_missing_env_file_is_not_an_error(self):
+        with patch.dict(app.os.environ, {}, clear=True):
+            app.load_env_file(Path(self.tmp.name) / "absent.env")
+            self.assertNotIn("GEMINI_API_KEY", app.os.environ)
+
+    def test_status_reports_configured_source_without_revealing_the_key(self):
+        req = Request("GET", "/api/ai/gemini/status")
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": self.SECRET}), patch.object(app, "GEMINI_KEY_SOURCE", "file"):
+            req.do_GET()
+        body = req.response.decode("utf-8")
+        self.assertEqual(req.status, 200)
+        self.assertEqual(json.loads(body), {"configured": True, "source": "file"})
+        self.assertNotIn(self.SECRET, body)
+
+    def test_missing_key_message_points_to_env_file_and_hides_values(self):
+        req = Request("POST", "/api/ai/story", json.dumps({"provider": "gemini", "idea": "Kisah hujan"}).encode())
+        with patch.dict(app.os.environ, {"GEMINI_API_KEY": ""}):
+            req.do_POST()
+        message = json.loads(req.response)["error"]
+        self.assertIn(".env", message)
+        self.assertNotIn(self.SECRET, message)

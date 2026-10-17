@@ -18,6 +18,31 @@ import zlib
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
+
+def load_env_file(path):
+    """Read KEY=VALUE lines from a local .env file. Existing non-empty environment variables win; values are never printed."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except (FileNotFoundError, UnicodeDecodeError):
+        return
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key or line.startswith("#") or not all(ch.isalnum() or ch == "_" for ch in key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if not os.environ.get(key, "").strip():
+            os.environ[key] = value
+
+GEMINI_KEY_SOURCE = "environment" if os.environ.get("GEMINI_API_KEY", "").strip() else None
+load_env_file(ROOT / ".env")
+if GEMINI_KEY_SOURCE is None and os.environ.get("GEMINI_API_KEY", "").strip():
+    GEMINI_KEY_SOURCE = "file"
 UPLOADS = DATA / "uploads"
 DB = DATA / "studio.sqlite3"
 MAX_ASSET_BYTES = 12_000_000
@@ -498,7 +523,7 @@ class GeminiProviderError(Exception):
 def make_gemini_story(idea, goal, duration, style):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise GeminiProviderError(503, "GEMINI_API_KEY belum dikonfigurasi pada environment server. Gemini tidak dijalankan.")
+        raise GeminiProviderError(503, "GEMINI_API_KEY belum terbaca oleh server. Isi file .env di folder proyek (sejajar dengan app.py), simpan, lalu jalankan ulang server. Gemini tidak dijalankan.")
     body = json.dumps({
         "contents": [{"parts": [{"text": story_prompt(idea, goal, duration, style)}]}],
         "generationConfig": {"temperature": 0.5, "maxOutputTokens": 3500},
@@ -599,7 +624,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/ai/gemini/status":
-            return self.send(200, json.dumps({"configured": bool(os.environ.get("GEMINI_API_KEY", "").strip())}))
+            configured = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+            return self.send(200, json.dumps({"configured": configured, "source": GEMINI_KEY_SOURCE if configured else None}))
         if path == "/api/ai/status":
             try:
                 models = local_ollama_models()

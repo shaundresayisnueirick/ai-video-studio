@@ -652,3 +652,25 @@ test('legacy project without character or location data opens and prompts as bef
   assert.equal(result.prompt.includes('Lokasi yang harus dipertahankan'), false);
   assert.ok(result.prompt.includes('Aksi: Berjalan.'));
 });
+
+test('autosave keeps the live project data object so writes made through an earlier render are saved', async () => {
+  const calls = [];
+  const { context } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (options?.method === 'PUT') return response(JSON.parse(options.body));
+      if (url === '/api/projects') return response([]);
+      return response({});
+    },
+  });
+  await tick();
+  vm.runInContext(`current=${JSON.stringify(project('p1'))};current.data=normalizeProductionData(current.data,current);current.data.scenes=[{id:'s1',title:'Satu'},{id:'s2',title:'Dua'}];projects=[current]`, context);
+  context.renderedData = vm.runInContext('current.data', context);
+  await vm.runInContext("current.data.scenes[0].title='Satu baru';saveNow()", context);
+  assert.equal(vm.runInContext('current.data === renderedData', context), true, 'autosave must not replace the data object used by open handlers');
+  context.renderedData.promptScene = 1;
+  await vm.runInContext('saveNow()', context);
+  const put = calls.filter(call => call.options?.method === 'PUT').at(-1);
+  assert.equal(JSON.parse(put.options.body).data.promptScene, 1);
+  assert.equal(vm.runInContext('current.data.promptScene', context), 1);
+});

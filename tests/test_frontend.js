@@ -54,9 +54,9 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
     fetch, console,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../static/app.js'), 'utf8'), context);
-  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style } = {}) {
+  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, resetPrompt } = {}) {
     const target = {
-      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style },
+      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, resetPrompt },
       closest(selector) {
         if (selector === '[data-tab]' && tab) return { dataset: { tab } };
         if (selector === '[data-view]' && view) return { dataset: { view } };
@@ -69,6 +69,7 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
   return {
     context, elements, session, click, confirmMessages,
     change: target => handlers.change({ target }),
+    input: target => handlers.input({ target }),
     element: selector => document.querySelector(selector),
     getScrolls: () => scrolls, getConfirms: () => confirms,
   };
@@ -1503,4 +1504,318 @@ test('an in-card notice hides a floating toast that is still on screen', async (
   element('#toast').classList.add('show');
   vm.runInContext("setPlanNotice('error', 'Contoh')", context);
   assert.equal(element('#toast').classList.contains('show'), false, 'the toast no longer covers the card');
+});
+
+// Tahap 2, Mode 1: Gemini is used by hand. The app prepares prompts and keeps the uploaded results linked.
+const openStoryboard = (context, p) => vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='storyboard';renderProject()`, context);
+const visualProject = () => {
+  const p = project('p1');
+  p.idea = 'Ibu dan anak';
+  p.data = {
+    ...p.data, duration: '30 detik', style: 'Ilustrasi hangat',
+    entities: {
+      characters: [{ id: 'char-rani', name: 'Rani', role: 'tokoh utama', appearance: 'rambut ikal, jaket kuning', signature: 'selalu memakai topi merah', source: 'manual' }],
+      locations: [{ id: 'loc-ruang', name: 'Ruang tamu', description: 'lampu kuning', source: 'manual' }],
+      products: [],
+    },
+    scenes: [{ id: 's1', title: 'Pertemuan', purpose: 'Rani membuka pintu', visual: 'Rani berdiri di ambang pintu', action: 'Rani membuka pintu', expression: 'terkejut', location: 'Ruang tamu', time: 'sore', camera: 'medium shot', lighting: 'hangat', characterIds: ['char-rani'], locationId: 'loc-ruang', productIds: [], referenceAssetIds: [], assetIds: [], productionChecklist: {} }],
+    assets: [],
+  };
+  return p;
+};
+const uploadingFetch = (asset, saved = []) => async (url, options) => {
+  if (options?.method === 'PUT') { saved.push(JSON.parse(options.body)); return response(JSON.parse(options.body)); }
+  if (options?.method === 'POST' && url.endsWith('/assets')) return response({ asset });
+  return response(url === '/api/projects' ? [] : {});
+};
+
+test('the storyboard shows a character sheet with facts, an editable Gemini prompt, copy, and a Gemini link', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, visualProject());
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /LEMBAR KARAKTER · GEMINI MANUAL/);
+  assert.match(html, /<h4>Rani<\/h4>/);
+  assert.match(html, /selalu memakai topi merah/);
+  assert.match(html, /data-char-prompt="char-rani"/);
+  assert.match(html, /data-copy-char="char-rani"/);
+  assert.match(html, /href="https:\/\/gemini\.google\.com\/"/);
+  assert.match(html, /data-entity-field="signature"/, 'the character form has the distinguishing-features field');
+  assert.equal(/gambar (sudah|telah) dibuat/i.test(html), false, 'no claim that an image exists yet');
+});
+
+test('a corrected character prompt is what gets copied, and the reset button restores the generated one', async () => {
+  const copied = [];
+  const { context, element, click, input } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, visualProject());
+  await tick();
+  input({ dataset: { charPrompt: 'char-rani' }, value: 'Rani versi koreksi, rambut panjang.' });
+  await click({ copyChar: 'char-rani' });
+  await tick();
+  assert.equal(copied[0], 'Rani versi koreksi, rambut panjang.');
+  await click({ resetPrompt: 'char:char-rani' });
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /Tokoh: Rani/);
+  assert.equal(vm.runInContext("'char:char-rani' in current.data.visualPrompts", context), false);
+});
+
+test('a scene moves from prompt ready, to waiting for Gemini, to a linked visual reference after the upload', async () => {
+  const copied = [];
+  const saved = [];
+  const { context, element, click, change } = appContext({
+    fetchImpl: uploadingFetch({ id: 'asset-scene-1', name: 'adegan-1.png', url: '/uploads/adegan-1.png', type: 'Adegan' }, saved),
+    clipboardImpl: async text => { copied.push(text); },
+  });
+  openStoryboard(context, visualProject());
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /Status:<\/b> Prompt siap/);
+  await click({ copyScene: 's1' });
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /Menunggu gambar dari Gemini/);
+  assert.match(copied[0], /Adegan: Pertemuan/);
+  assert.match(copied[0], /Rani \(rambut ikal, jaket kuning\)/);
+  change({ dataset: { sceneUpload: 's1' }, files: [{ name: 'adegan-1.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.match(element('#tab-content').innerHTML, /Referensi visual tersedia/);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.scenes[0].referenceAssetIds)', context)), ['asset-scene-1']);
+  assert.equal(vm.runInContext('current.data.assets[0].sceneId', context), 's1');
+});
+
+test('a character reference is saved with its label and character, and the label can be changed', async () => {
+  const saved = [];
+  const { context, element, change } = appContext({ fetchImpl: uploadingFetch({ id: 'asset-rani-1', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter' }, saved) });
+  openStoryboard(context, visualProject());
+  await tick();
+  element('[data-ref-label-select="characters:char-rani"]').value = 'pakaian';
+  change({ dataset: { refUpload: '', refKind: 'characters', refId: 'char-rani' }, files: [{ name: 'wajah.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.ok(vm.runInContext('saveTimer', context), 'an autosave is scheduled after the link is made, without a manual save');
+  const asset = JSON.parse(vm.runInContext('JSON.stringify(current.data.assets[0])', context));
+  assert.deepEqual([asset.label, asset.entityKind, asset.entityId], ['pakaian', 'characters', 'char-rani']);
+  assert.match(element('#tab-content').innerHTML, /<span>wajah\.png<\/span>/);
+  change({ dataset: { assetLabel: 'asset-rani-1' }, value: 'wajah' });
+  await tick();
+  assert.equal(vm.runInContext('current.data.assets[0].label', context), 'wajah');
+});
+
+test('an older project without the new fields still opens the storyboard, with an empty sheet and no corrections', async () => {
+  const p = visualProject();
+  delete p.data.visualPrompts;
+  delete p.data.visualState;
+  delete p.data.entities.characters[0].signature;
+  p.data.assets = [{ id: 'a-old', name: 'lama.png', url: '/uploads/lama.png', type: 'Karakter' }];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /<h4>Rani<\/h4>/);
+  assert.match(html, /belum diisi/, 'a missing distinguishing feature is shown as not filled in');
+  assert.equal(vm.runInContext('Object.keys(current.data.visualPrompts).length', context), 0);
+  assert.match(html, /Status:<\/b> Prompt siap/);
+});
+
+test('corrections, labels, and scene status are saved with the project and still show after a reload', async () => {
+  const saved = [];
+  const { context, element, change, click } = appContext({ fetchImpl: uploadingFetch({ id: 'asset-rani-2', name: 'ekspresi.png', url: '/uploads/ekspresi.png', type: 'Karakter' }, saved), clipboardImpl: async () => {} });
+  openStoryboard(context, visualProject());
+  await tick();
+  element('[data-ref-label-select="characters:char-rani"]').value = 'ekspresi';
+  change({ dataset: { refUpload: '', refKind: 'characters', refId: 'char-rani' }, files: [{ name: 'ekspresi.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  await click({ copyScene: 's1' });
+  await vm.runInContext('saveNow()', context);
+  const stored = saved[saved.length - 1].data;
+  assert.equal(typeof stored.visualState['scene:s1'].copiedAt, 'string');
+  assert.equal(stored.assets.find(a => a.id === 'asset-rani-2').label, 'ekspresi');
+  const reloaded = { ...visualProject(), data: stored };
+  const second = appContext({ fetchImpl: planFetch(), projects: [reloaded] });
+  openStoryboard(second.context, reloaded);
+  await tick();
+  const html = second.element('#tab-content').innerHTML;
+  assert.match(html, /Menunggu gambar dari Gemini/);
+  assert.match(html, /<option value="ekspresi" selected>/);
+});
+
+test('clicks, changes, and typing outside the visual controls do not touch project data when no project is open', async () => {
+  const { context, click, change, input } = appContext({ fetchImpl: planFetch() });
+  vm.runInContext('current=null', context);
+  await assert.doesNotReject(click({ tab: 'idea' }));
+  await assert.doesNotReject(click({ open: 'p1' }));
+  assert.doesNotThrow(() => change({ dataset: { other: 'x' }, value: 'y' }));
+  assert.doesNotThrow(() => input({ dataset: {}, value: 'y' }));
+});
+
+test('the scene prompt names the saved character references by label, and each step to Gemini is spelled out', async () => {
+  const { context, element } = appContext({ fetchImpl: uploadingFetch({ id: 'a-wajah', name: 'wajah.png', url: '/uploads/w.png', type: 'Karakter' }) });
+  const p = visualProject();
+  p.data.assets = [{ id: 'a-wajah', name: 'wajah.png', url: '/uploads/w.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' }];
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Referensi tokoh yang sudah disimpan \(lampirkan di Gemini\): Rani \(Wajah\)/);
+  assert.match(html, /Langkah: salin prompt → buka Gemini/);
+  assert.match(html, /belum ada gambar sampai Anda mengunggahnya/);
+});
+
+// Round 2 of Mode 1: previews, replace and delete, locations and products with references.
+const assetFetch = ({ queue = [], saved = [], deleted = [] } = {}) => async (url, options) => {
+  if (options?.method === 'PUT') { saved.push(JSON.parse(options.body)); return response(JSON.parse(options.body)); }
+  if (options?.method === 'DELETE') { deleted.push(url); return response({}); }
+  if (options?.method === 'POST' && url.endsWith('/assets')) return response({ asset: queue.shift() });
+  return response(url === '/api/projects' ? [] : {});
+};
+const roundTwoProject = () => {
+  const p = visualProject();
+  p.data.entities.locations = [
+    { id: 'loc-ruang', name: 'Ruang tamu', description: 'lampu kuning', source: 'manual' },
+    { id: 'loc-dapur', name: 'Dapur', description: 'kompor tua', source: 'manual' },
+  ];
+  p.data.entities.products = [{ id: 'prod-kopi', name: 'Kopi kemasan', description: 'kemasan biru, tutup emas', source: 'manual' }, { id: 'prod-lain', name: 'Teh lain', description: 'kotak hijau', source: 'manual' }];
+  p.data.scenes[0].locationId = 'loc-ruang';
+  p.data.scenes[0].productIds = ['prod-kopi'];
+  return p;
+};
+
+test('a character card shows a thumbnail after the upload, and the label can be changed and the image deleted', async () => {
+  const deleted = [];
+  const { context, element, change, click } = appContext({ fetchImpl: assetFetch({ queue: [{ id: 'a-rani', name: 'wajah.png', url: '/uploads/rani-wajah.png', type: 'Karakter' }], deleted }), confirmImpl: () => true });
+  openStoryboard(context, visualProject());
+  await tick();
+  change({ dataset: { refUpload: '', refKind: 'characters', refId: 'char-rani' }, files: [{ name: 'wajah.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  let html = element('#tab-content').innerHTML;
+  assert.match(html, /<img class="ref-thumb" src="\/uploads\/rani-wajah\.png"/, 'the uploaded image is previewed on the character card');
+  change({ dataset: { assetLabel: 'a-rani' }, value: 'ekspresi' });
+  await tick();
+  assert.equal(vm.runInContext("current.data.assets[0].label", context), 'ekspresi');
+  await click({ deleteAsset: 'a-rani' });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(vm.runInContext('current.data.assets.length', context), 0, 'the reference is removed from the project');
+  assert.equal(deleted.length, 1);
+  assert.match(deleted[0], /\/assets\/a-rani$/);
+});
+
+test('replacing a reference keeps its label and link, and removes the old image', async () => {
+  const deleted = [];
+  const p = visualProject();
+  p.data.assets = [{ id: 'a-old', name: 'lama.png', url: '/uploads/lama.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'pakaian' }];
+  const { context, change } = appContext({ fetchImpl: assetFetch({ queue: [{ id: 'a-new', name: 'baru.png', url: '/uploads/baru.png', type: 'Karakter' }], deleted }), confirmImpl: () => true });
+  openStoryboard(context, p);
+  await tick();
+  change({ dataset: { refReplace: 'a-old' }, files: [{ name: 'baru.png', type: 'image/png' }] });
+  for (let i = 0; i < 8; i++) await tick();
+  const assets = JSON.parse(vm.runInContext('JSON.stringify(current.data.assets)', context));
+  assert.deepEqual(assets.map(a => a.id), ['a-new']);
+  assert.deepEqual([assets[0].label, assets[0].entityKind, assets[0].entityId], ['pakaian', 'characters', 'char-rani']);
+  assert.match(deleted.join(' '), /\/assets\/a-old$/);
+});
+
+test('replacing a reference saves the new link before the old image is deleted, so the old record cannot return', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push(`${options?.method || 'GET'} ${url}`);
+    if (options?.method === 'PUT') return response(JSON.parse(options.body));
+    if (options?.method === 'DELETE') return response({ project: { ...visualProject(), data: { ...visualProject().data, assets: [] } } });
+    if (options?.method === 'POST' && url.endsWith('/assets')) return response({ asset: { id: 'a-new', name: 'baru.png', url: '/uploads/baru.png', type: 'Karakter' } });
+    return response(url === '/api/projects' ? [] : {});
+  };
+  const p = visualProject();
+  p.data.assets = [{ id: 'a-old', name: 'lama.png', url: '/uploads/lama.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani' }];
+  const { context, change } = appContext({ fetchImpl, confirmImpl: () => true });
+  openStoryboard(context, p);
+  await tick();
+  change({ dataset: { refReplace: 'a-old' }, files: [{ name: 'baru.png', type: 'image/png' }] });
+  for (let i = 0; i < 8; i++) await tick();
+  const deleteAt = calls.findIndex(c => c.startsWith('DELETE'));
+  assert.notEqual(deleteAt, -1, 'the old image is deleted');
+  assert.ok(calls.slice(0, deleteAt).some(c => c.startsWith('PUT')), 'a save of the new link happens before the delete');
+  assert.deepEqual(calls.slice(deleteAt + 1).filter(c => c.startsWith('PUT')), [], 'no later save may bring back the deleted record');
+});
+
+test('a location can hold several reference images, and no duplicate location is created', async () => {
+  const queue = [{ id: 'a-r1', name: 'ruang-1.png', url: '/uploads/r1.png', type: 'Lokasi' }, { id: 'a-r2', name: 'ruang-2.png', url: '/uploads/r2.png', type: 'Lokasi' }];
+  const { context, element, change } = appContext({ fetchImpl: assetFetch({ queue }), confirmImpl: () => true });
+  openStoryboard(context, roundTwoProject());
+  await tick();
+  element('[data-ref-label-select="locations:loc-ruang"]').value = 'detail';
+  change({ dataset: { refUpload: '', refKind: 'locations', refId: 'loc-ruang' }, files: [{ name: 'ruang-1.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  change({ dataset: { refUpload: '', refKind: 'locations', refId: 'loc-ruang' }, files: [{ name: 'ruang-2.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  const assets = JSON.parse(vm.runInContext('JSON.stringify(current.data.assets)', context));
+  assert.deepEqual(assets.map(a => [a.entityKind, a.entityId, a.label]), [['locations', 'loc-ruang', 'detail'], ['locations', 'loc-ruang', 'detail']]);
+  assert.equal(vm.runInContext('current.data.entities.locations.length', context), 2, 'no duplicate location entity');
+  assert.match(element('#tab-content').innerHTML, /src="\/uploads\/r2\.png"/);
+});
+
+test('the scene prompt names only the linked location and products, with their saved references', async () => {
+  const copied = [];
+  const p = roundTwoProject();
+  p.data.assets = [
+    { id: 'l1', name: 'ruang.png', url: '/uploads/l1.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+    { id: 'l2', name: 'dapur.png', url: '/uploads/l2.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-dapur', label: 'utama' },
+    { id: 'p1', name: 'kopi.png', url: '/uploads/p1.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' },
+    { id: 'p2', name: 'teh.png', url: '/uploads/p2.png', type: 'Produk', entityKind: 'products', entityId: 'prod-lain', label: 'detail' },
+  ];
+  const { context, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, p);
+  await tick();
+  await click({ copyScene: 's1' });
+  const text = copied[0];
+  assert.match(text, /Referensi lokasi yang sudah disimpan \(lampirkan di Gemini\): Ruang tamu \(Tampilan utama\)/);
+  assert.match(text, /Produk: Kopi kemasan \(kemasan biru, tutup emas\)/);
+  assert.match(text, /Referensi produk yang sudah disimpan \(lampirkan di Gemini\): Kopi kemasan \(Tampilan utama\)/);
+  assert.equal(/Dapur|kompor tua/.test(text), false, 'the unlinked location is not in the prompt');
+  assert.equal(/Teh lain|kotak hijau/.test(text), false, 'the unlinked product is not in the prompt');
+});
+
+test('products can be added, linked to a scene and unlinked, and removing a product keeps the scene location', async () => {
+  const { context, change, click } = appContext({ fetchImpl: planFetch(), confirmImpl: () => true });
+  openStoryboard(context, roundTwoProject());
+  await tick();
+  await click({ id: 'add-product' });
+  await tick();
+  const newId = vm.runInContext('current.data.entities.products[2].id', context);
+  assert.match(newId, /^prod-/);
+  change({ dataset: { sceneProduct: newId, sceneId: 's1' }, checked: true });
+  assert.ok(JSON.parse(vm.runInContext('JSON.stringify(current.data.scenes[0].productIds)', context)).includes(newId));
+  change({ dataset: { sceneProduct: newId, sceneId: 's1' }, checked: false });
+  assert.equal(vm.runInContext('current.data.scenes[0].productIds.includes(' + JSON.stringify(newId) + ')', context), false);
+  vm.runInContext("removeEntity(current.data,'products','prod-kopi')", context);
+  assert.equal(vm.runInContext('current.data.scenes[0].locationId', context), 'loc-ruang', 'removing a product does not clear the scene location');
+  assert.equal(vm.runInContext('current.data.scenes[0].productIds.length', context), 0);
+});
+
+test('references, product links, and the location link all survive a save and a reload', async () => {
+  const saved = [];
+  const queue = [{ id: 'a-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi' }];
+  const { context, element, change, click } = appContext({ fetchImpl: assetFetch({ queue, saved }), clipboardImpl: async () => {} });
+  openStoryboard(context, roundTwoProject());
+  await tick();
+  change({ dataset: { refUpload: '', refKind: 'locations', refId: 'loc-ruang' }, files: [{ name: 'ruang.png', type: 'image/png' }] });
+  for (let i = 0; i < 6; i++) await tick();
+  await click({ copyScene: 's1' });
+  await vm.runInContext('saveNow()', context);
+  const stored = saved[saved.length - 1].data;
+  const reloaded = { ...roundTwoProject(), data: stored };
+  const second = appContext({ fetchImpl: planFetch(), projects: [reloaded] });
+  openStoryboard(second.context, reloaded);
+  await tick();
+  const html = second.element('#tab-content').innerHTML;
+  assert.match(html, /src="\/uploads\/ruang\.png"/);
+  assert.match(html, /data-scene-product="prod-kopi" data-scene-id="s1" checked/);
+  assert.match(html, /data-scene-location[\s\S]*<option value="loc-ruang" selected>/);
+});
+
+test('an older project with no product list and no location references still opens cleanly', async () => {
+  const p = visualProject();
+  delete p.data.entities.products;
+  delete p.data.entities.locations[0];
+  p.data.entities.locations = [];
+  p.data.scenes[0].productIds = undefined;
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.entities.products)', context)), []);
+  assert.match(element('#tab-content').innerHTML, /id="add-product"/);
 });

@@ -1910,3 +1910,263 @@ test('an older project without visual prompts opens with default location and pr
   assert.match(element('#tab-content').innerHTML, /data-entity-prompt="loc:loc-dapur"/);
   assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.visualPrompts)', context)), {});
 });
+
+// Round 3 of Mode 1: storyboard summary, separate video prompt, Google Flow package.
+const twoSceneProject = () => {
+  const p = roundTwoProject();
+  p.data.scenes.push({ id: 's2', title: 'Di dapur', purpose: 'Rani mencari kopi', visual: 'Dapur kosong', action: 'Rani membuka lemari', expression: 'fokus', location: 'Dapur', time: 'pagi', camera: 'close-up', cameraAngle: 'dari atas', cameraMovement: 'pan pelan', lighting: 'dingin', duration: '4 detik', characterIds: [], locationId: 'loc-dapur', productIds: [], referenceAssetIds: [], assetIds: [], productionChecklist: {}, approvalStatus: 'draft', production: 'Draft' });
+  return p;
+};
+const sceneHtml = (html, index) => html.split('<article class="scene-card"')[index + 1] || '';
+
+test('each scene card shows only its own storyboard image, and a placeholder when it has none', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'img-s1', name: 'adegan1.png', url: '/uploads/adegan1.png', type: 'Adegan', sceneId: 's1', referenceAssetIds: undefined },
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  const first = sceneHtml(html, 0), second = sceneHtml(html, 1);
+  assert.match(first, /<img class="scene-thumb" src="\/uploads\/adegan1\.png"/, 'scene 1 shows its own storyboard image');
+  assert.equal(/wajah\.png/.test(first.slice(0, first.indexOf('Langkah berikutnya'))), false, 'a character reference is never used as the storyboard thumbnail');
+  assert.equal(/adegan1\.png|src="\/uploads/.test(second.slice(0, second.indexOf('Langkah berikutnya'))), false, 'scene 2 does not show scene 1 image');
+  assert.match(second, /Belum ada gambar storyboard/, 'scene 2 shows a clear placeholder');
+  assert.match(first, /data-thumb/, 'the thumbnail can be replaced by a missing-file note');
+});
+
+test('the scene summary lists the linked character, location, product, and shot details', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [{ id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' }];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneHtml(element('#tab-content').innerHTML, 0);
+  const summary = first.slice(first.indexOf('scene-summary'), first.indexOf('Langkah berikutnya'));
+  assert.match(summary, /<dt>Tokoh<\/dt><dd>Rani<\/dd>/);
+  assert.match(summary, /<dt>Lokasi<\/dt><dd>Ruang tamu<\/dd>/);
+  assert.match(summary, /<dt>Produk<\/dt><dd>Kopi kemasan<\/dd>/);
+  assert.match(summary, /<dt>Status gambar<\/dt><dd>Prompt siap<\/dd>/);
+  assert.match(summary, /<dt>Prompt video<\/dt><dd>belum disalin<\/dd>/);
+});
+
+test('the next step asks for missing references first, then the storyboard image, then the Flow run', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [];
+  const { context, element, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async () => {} });
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Buat atau unggah ulang referensi untuk Rani di bagian Lembar karakter/);
+  p.data.assets = [
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+    { id: 'p-kopi', name: 'kopi.png', url: '/uploads/kopi.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' },
+  ];
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Buat gambar storyboard di Gemini/);
+  await click({ copyEntity: 'video:s1' });
+  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Prompt video<\/dt><dd>sudah disalin/);
+});
+
+test('the video prompt describes motion and camera, is kept separate from the image prompt, and can be edited and copied', async () => {
+  const copied = [];
+  const p = twoSceneProject();
+  const { context, element, click, input } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /data-entity-prompt="video:s1"/, 'the video prompt is editable');
+  assert.match(html, /Prompt video untuk Google Flow/);
+  assert.match(html, /href="https:\/\/labs\.google\/fx\/tools\/flow"[^>]*>Buka Google Flow/);
+  await click({ copyEntity: 'video:s1' });
+  assert.match(copied[0], /Aksi utama: Rani membuka pintu/);
+  assert.match(copied[0], /Gerakan kamera: diam atau bergerak pelan, sesuai aksi\./);
+  assert.match(copied[0], /Durasi klip: 5 detik/);
+  assert.notEqual(copied[0], vm.runInContext("scenePrompt(current.data.scenes[0], current.data)", context), 'the video prompt is not the image prompt');
+  input({ dataset: { entityPrompt: 'video:s1' }, value: 'Rani berjalan ke pintu, lalu berhenti.' });
+  assert.equal(vm.runInContext("current.data.visualPrompts['video:s1']", context), 'Rani berjalan ke pintu, lalu berhenti.');
+  await click({ copyEntity: 'video:s1' });
+  assert.equal(copied[1], 'Rani berjalan ke pintu, lalu berhenti.');
+  await click({ resetPrompt: 'video:s1' });
+  assert.equal(vm.runInContext("'video:s1' in current.data.visualPrompts", context), false, 'restoring removes the edit');
+});
+
+test('the Google Flow package lists only the references linked to that scene, with their availability', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l-dapur', name: 'dapur.png', url: '/uploads/dapur.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-dapur', label: 'utama' },
+    { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const [one, two] = [sceneHtml(element('#tab-content').innerHTML, 0), sceneHtml(element('#tab-content').innerHTML, 1)];
+  const packageOne = one.slice(one.indexOf('flow-package'));
+  const packageTwo = two.slice(two.indexOf('flow-package'));
+  assert.match(packageOne, /<b>Karakter: Rani<\/b> · wajah\.png — belum dapat dipastikan/, 'a file that is not yet checked is not called ready');
+  assert.match(packageOne, /<b>Lokasi: Ruang tamu<\/b> · ruang\.png — belum dapat dipastikan/);
+  assert.match(packageOne, /<b>Produk: Kopi kemasan<\/b> · belum ada gambar referensi/, 'a product without images says so');
+  assert.equal(/dapur\.png|Dapur/.test(packageOne), false, 'the other location is not in scene 1');
+  assert.match(packageTwo, /<b>Lokasi: Dapur<\/b> · dapur\.png — belum dapat dipastikan/);
+  assert.equal(/wajah\.png/.test(packageTwo), false, 'the character is not in scene 2');
+  assert.match(packageOne, /Belum dapat dipastikan keberadaannya: wajah\.png, ruang\.png\./);
+  assert.equal(/File siap diunggah manual di Flow/.test(packageOne), false, 'nothing is ready before the check finishes');
+});
+
+test('a scene with no linked references says so in the Flow package and in the summary', async () => {
+  const p = twoSceneProject();
+  p.data.scenes[0].characterIds = [];
+  p.data.scenes[0].locationId = '';
+  p.data.scenes[0].productIds = [];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Belum ada karakter, lokasi, atau produk yang tertaut ke adegan ini\./);
+  assert.match(html, /Belum ada file yang siap diunggah/);
+});
+
+test('the image prompt names the shot and camera angle, and the video prompt names the camera movement', async () => {
+  const copied = [];
+  const { context, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, twoSceneProject());
+  await tick();
+  await click({ copyScene: 's2' });
+  assert.match(copied[0], /Kamera: close-up/);
+  assert.match(copied[0], /Sudut kamera: dari atas/);
+  assert.equal(/Gerakan kamera/.test(copied[0]), false, 'a still image prompt does not describe movement');
+  await click({ copyEntity: 'video:s2' });
+  assert.match(copied[1], /Gerakan kamera: pan pelan\./);
+  assert.match(copied[1], /Sudut kamera: dari atas\./);
+});
+
+test('an older scene without the new camera fields or prompt store still opens, and shows the new fields empty', async () => {
+  const p = twoSceneProject();
+  delete p.data.visualPrompts;
+  delete p.data.visualState;
+  delete p.data.scenes[0].cameraAngle;
+  delete p.data.scenes[0].cameraMovement;
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /data-field="cameraAngle" value=""/);
+  assert.match(html, /data-field="cameraMovement" value=""/);
+  assert.match(html, /data-entity-prompt="video:s1"/);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.visualPrompts)', context)), {});
+});
+
+// Round 3 fixes: file status is only "ready" once the file is confirmed, the summary and next step report missing files,
+// legacy camera text stays in the camera field, and both prompts explain themselves.
+test('a Flow file is called ready only when confirmed; missing and unchecked files are listed separately', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  vm.runInContext("assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/wajah.png','missing')", context);
+  openStoryboard(context, p);
+  await tick();
+  const pkg = element('#tab-content').innerHTML.slice(element('#tab-content').innerHTML.indexOf('flow-package'));
+  assert.match(pkg, /<b>Lokasi: Ruang tamu<\/b> · ruang\.png — siap diunggah/);
+  assert.match(pkg, /<b>Karakter: Rani<\/b> · wajah\.png — file tidak ditemukan; unggah ulang/);
+  assert.match(pkg, /File siap diunggah manual di Flow: ruang\.png\./);
+  assert.match(pkg, /File tidak ditemukan: wajah\.png\./);
+  assert.equal(/File siap diunggah manual di Flow: [^.]*wajah/.test(pkg), false, 'a missing file is never listed as ready');
+});
+
+test('a missing storyboard file is reported in the summary and as the next step', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'img-s1', name: 'adegan1.png', url: '/uploads/adegan1.png', type: 'Adegan', sceneId: 's1' },
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+    { id: 'p-kopi', name: 'kopi.png', url: '/uploads/kopi.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  vm.runInContext("assetFileState.set('/uploads/adegan1.png','missing');assetFileState.set('/uploads/wajah.png','ok');assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/kopi.png','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneHtml(element('#tab-content').innerHTML, 0);
+  assert.match(first, /<dt>Status gambar<\/dt><dd>Gambar adegan tidak ditemukan<\/dd>/);
+  assert.match(first, /Gambar adegan tidak ditemukan; unggah ulang di bagian Gambar adegan\./);
+});
+
+test('a checked-but-unknown file is not shown as ready in the summary', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [{ id: 'img-s1', name: 'adegan1.png', url: '/uploads/adegan1.png', type: 'Adegan', sceneId: 's1' }];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneHtml(element('#tab-content').innerHTML, 0);
+  assert.equal(/siap diunggah/.test(first), false);
+  assert.match(first, /Belum dapat dipastikan keberadaannya: adegan1\.png/);
+  assert.match(first, /<dt>Status gambar<\/dt><dd>Gambar adegan sedang diperiksa<\/dd>/, 'the summary does not claim the image is ready');
+});
+
+test('an old scene camera value stays under the camera label and is not read as a shot or a movement', async () => {
+  const copied = [];
+  const p = twoSceneProject();
+  p.data.scenes[0].camera = 'dolly pelan ke depan';
+  delete p.data.scenes[0].cameraMovement;
+  const { context, element, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /<label>Framing \/ gerak kamera<textarea data-field="camera">dolly pelan ke depan<\/textarea>/, 'the old value keeps its original label');
+  assert.equal(/Jenis shot/.test(html), false, 'no field is renamed to shot');
+  await click({ copyEntity: 'video:s1' });
+  assert.match(copied[0], /Catatan kamera dari adegan: dolly pelan ke depan\./);
+  assert.match(copied[0], /Gerakan kamera: diam atau bergerak pelan, sesuai aksi\./, 'the movement line is not filled from the old value');
+});
+
+test('the tab 05 prompt and the Google Flow package each say what their prompt is for, and tab 05 still works', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, twoSceneProject());
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /khusus Google Flow/, 'the storyboard explains the Flow prompt');
+  vm.runInContext("activeTab='prompt';renderProject()", context);
+  await tick();
+  const prompt = element('#tab-content').innerHTML;
+  assert.match(prompt, /Prompt di tab ini adalah prompt umum/, 'tab 05 explains its own prompt');
+  assert.match(prompt, /id="copy-prompt"/, 'tab 05 keeps its copy button');
+  assert.match(prompt, /id="prompt-text"/, 'tab 05 keeps its editable prompt');
+});
+
+test('a storyboard image with a non-upload address is shown the same way in the thumbnail, summary, and Flow list', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [{ id: 'img-s1', name: 'adegan1.png', url: '/files/adegan1.png', type: 'Adegan', sceneId: 's1' }];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  const first = sceneHtml(html, 0), second = sceneHtml(html, 1);
+  assert.equal(/Belum ada gambar storyboard/.test(first), false, 'a stored image that is not usable is not described as absent');
+  assert.match(first, /<b>Gambar adegan tidak ditemukan<\/b>/, 'the thumbnail says the image is missing');
+  assert.match(first, /<dt>Status gambar<\/dt><dd>Gambar adegan tidak ditemukan<\/dd>/, 'the summary agrees');
+  assert.match(first, /<b>Gambar adegan<\/b> · adegan1\.png — file tidak ditemukan; unggah ulang/, 'the Flow list agrees');
+  assert.doesNotMatch(first, /<img class="scene-thumb"/, 'no broken image is rendered');
+  assert.match(second, /Belum ada gambar storyboard/, 'a scene with no stored image still shows the absent placeholder');
+});
+
+test('when a scene has one usable and one unusable storyboard image, the thumbnail uses the usable one', async () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'img-bad', name: 'lama.png', url: '/files/lama.png', type: 'Adegan', sceneId: 's1' },
+    { id: 'img-ok', name: 'baru.png', url: '/uploads/baru.png', type: 'Adegan', sceneId: 's1' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  vm.runInContext("assetFileState.set('/uploads/baru.png','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneHtml(element('#tab-content').innerHTML, 0);
+  assert.match(first, /<img class="scene-thumb" src="\/uploads\/baru\.png"/);
+  assert.equal(/lama\.png/.test(first.slice(0, first.indexOf('Langkah berikutnya'))), false, 'the unusable image is not the thumbnail');
+  assert.match(first, /<dt>Status gambar<\/dt><dd>Referensi visual tersedia<\/dd>/, 'the summary reports the usable image');
+  assert.match(first, /Gambar adegan<\/b> · lama\.png — file tidak ditemukan/, 'the unusable image is still listed as missing');
+});

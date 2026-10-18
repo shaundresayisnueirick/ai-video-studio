@@ -54,9 +54,9 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
     fetch, console,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../static/app.js'), 'utf8'), context);
-  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, resetPrompt } = {}) {
+  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt } = {}) {
     const target = {
-      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, resetPrompt },
+      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt },
       closest(selector) {
         if (selector === '[data-tab]' && tab) return { dataset: { tab } };
         if (selector === '[data-view]' && view) return { dataset: { view } };
@@ -1818,4 +1818,95 @@ test('an older project with no product list and no location references still ope
   await tick();
   assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.entities.products)', context)), []);
   assert.match(element('#tab-content').innerHTML, /id="add-product"/);
+});
+
+// Phase 2 of Mode 1: location and product prompts, editing and restoring, storyboard attachment list.
+test('a location has a default Gemini prompt that keeps its identity, is copied, and names saved references as guidance', async () => {
+  const copied = [];
+  const p = roundTwoProject();
+  p.data.assets = [{ id: 'l1', name: 'ruang.png', url: '/uploads/l1.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' }];
+  const { context, element, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /data-entity-prompt="loc:loc-ruang"/, 'the location prompt is editable');
+  assert.match(html, /data-copy-entity="loc:loc-ruang"/);
+  assert.match(html, /href="https:\/\/gemini\.google\.com\/"[^>]*>Buka Gemini/, 'the location prompt opens Gemini');
+  await click({ copyEntity: 'loc:loc-ruang' });
+  const text = copied[0];
+  assert.match(text, /Lokasi: Ruang tamu/);
+  assert.match(text, /Suasana dan detail: lampu kuning/);
+  assert.match(text, /tata ruang, arsitektur/, 'the prompt keeps the layout and architecture fixed');
+  assert.match(text, /Referensi yang sudah ada untuk lokasi ini: Tampilan utama \(ruang\.png\)/, 'the saved image of the same location is guidance');
+  assert.equal(/Dapur|kompor tua/.test(text), false);
+});
+
+test('a location prompt can be edited, copied, restored, and follows a description change until it is edited', async () => {
+  const copied = [];
+  const { context, click, input } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, roundTwoProject());
+  await tick();
+  input({ dataset: { entityPrompt: 'loc:loc-ruang' }, value: 'Ruang tamu versi malam, lampu hangat' });
+  assert.equal(vm.runInContext("current.data.visualPrompts['loc:loc-ruang']", context), 'Ruang tamu versi malam, lampu hangat');
+  await click({ copyEntity: 'loc:loc-ruang' });
+  assert.equal(copied[0], 'Ruang tamu versi malam, lampu hangat');
+  vm.runInContext("current.data.entities.locations[0].description='jendela besar'", context);
+  await click({ copyEntity: 'loc:loc-ruang' });
+  assert.equal(copied[1], 'Ruang tamu versi malam, lampu hangat', 'an edited prompt is kept after the description changes');
+  await click({ resetPrompt: 'loc:loc-ruang' });
+  assert.equal(vm.runInContext("'loc:loc-ruang' in current.data.visualPrompts", context), false);
+  await click({ copyEntity: 'loc:loc-ruang' });
+  assert.match(copied[2], /Suasana dan detail: jendela besar/, 'restoring the default uses the current description');
+});
+
+test('a product has a default Gemini prompt that keeps its form and label, and its prompt can be edited and restored', async () => {
+  const copied = [];
+  const p = roundTwoProject();
+  p.data.assets = [{ id: 'p1', name: 'kopi.png', url: '/uploads/p1.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' }];
+  const { context, element, click, input } = appContext({ fetchImpl: planFetch(), clipboardImpl: async text => { copied.push(text); } });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /data-entity-prompt="prod:prod-kopi"/);
+  assert.match(html, /data-copy-entity="prod:prod-kopi"/);
+  await click({ copyEntity: 'prod:prod-kopi' });
+  assert.match(copied[0], /Produk: Kopi kemasan/);
+  assert.match(copied[0], /Deskripsi: kemasan biru, tutup emas/);
+  assert.match(copied[0], /bentuk, warna, proporsi, kemasan, label, dan detail merek/);
+  assert.match(copied[0], /Referensi yang sudah ada untuk produk ini: Tampilan utama \(kopi\.png\)/);
+  input({ dataset: { entityPrompt: 'prod:prod-kopi' }, value: 'Kopi kemasan, label dari gambar acuan' });
+  await click({ copyEntity: 'prod:prod-kopi' });
+  assert.equal(copied[1], 'Kopi kemasan, label dari gambar acuan');
+  await click({ resetPrompt: 'prod:prod-kopi' });
+  await click({ copyEntity: 'prod:prod-kopi' });
+  assert.match(copied[2], /Produk: Kopi kemasan/, 'restoring brings back the default prompt');
+});
+
+test('the storyboard lists which saved images to attach in Gemini, and only for the linked characters, location and products', async () => {
+  const p = roundTwoProject();
+  p.data.assets = [
+    { id: 'c1', name: 'wajah.png', url: '/uploads/c1.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l1', name: 'ruang.png', url: '/uploads/l1.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+    { id: 'l2', name: 'dapur.png', url: '/uploads/l2.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-dapur', label: 'utama' },
+  ];
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Lampirkan di Gemini/);
+  assert.match(html, /<b>Karakter Rani<\/b>: lampirkan Wajah \(1 gambar\)/);
+  assert.match(html, /<b>Lokasi Ruang tamu<\/b>: lampirkan Tampilan utama \(1 gambar\)/);
+  assert.match(html, /<b>Produk Kopi kemasan<\/b>: belum ada gambar referensi/);
+  assert.equal(/Dapur/.test(html.slice(html.indexOf('Lampirkan di Gemini'), html.indexOf('Prompt gambar'))), false, 'the unlinked location is not listed for attachment');
+});
+
+test('an older project without visual prompts opens with default location and product prompts', async () => {
+  const p = roundTwoProject();
+  delete p.data.visualPrompts;
+  delete p.data.visualState;
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /data-entity-prompt="loc:loc-dapur"/);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.visualPrompts)', context)), {});
 });

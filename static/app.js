@@ -82,6 +82,27 @@ function scenePromptDefault(s,d){
     s.camera?`Sudut dan gerak kamera: ${s.camera}`:'', s.lighting?`Pencahayaan: ${s.lighting}`:'', d.style?`Gaya visual: ${d.style}`:'',
     'Lampirkan lembar karakter yang sudah Anda buat di Gemini agar wajah dan pakaian tokoh tetap sama.'].filter(Boolean).join('\n');
 }
+function locationPromptDefault(l,d){
+  const refs=entityRefs(d,'locations',l.id).map(a=>`${visualLabelText(a.label)} (${a.name})`);
+  return ['Buat gambar referensi lokasi untuk satu ruang atau tempat yang konsisten dengan cerita. Gambar diam, tanpa tokoh dan tanpa teks di dalam gambar.',
+    `Lokasi: ${l.name||'tanpa nama'}`, l.description?`Suasana dan detail: ${l.description}`:'', d.style?`Gaya visual: ${d.style}`:'',
+    refs.length?`Referensi yang sudah ada untuk lokasi ini: ${refs.join('; ')}. Untuk variasi atau sudut tambahan, ikuti referensi ini dan tetap di ruang yang sama.`:'',
+    'Pertahankan identitas lokasi: tata ruang, arsitektur, bentuk jendela dan pintu, perabot, serta elemen visual tetap yang disebutkan di atas. Jangan mengubah desain ruang atau suasana yang ditentukan.'].filter(Boolean).join('\n');
+}
+function productPromptDefault(p,d){
+  const refs=entityRefs(d,'products',p.id).map(a=>`${visualLabelText(a.label)} (${a.name})`);
+  return ['Buat lembar referensi produk: gambar diam, produk utuh di latar belakang polos, tanpa tokoh dan tanpa teks tambahan.',
+    `Produk: ${p.name||'tanpa nama'}`, p.description?`Deskripsi: ${p.description}`:'', d.style?`Gaya visual: ${d.style}`:'',
+    refs.length?`Referensi yang sudah ada untuk produk ini: ${refs.join('; ')}. Ikuti referensi ini untuk bentuk dan label.`:'',
+    'Pertahankan bentuk, warna, proporsi, kemasan, label, dan detail merek sesuai deskripsi di atas. Jangan menambahkan logo atau tulisan merek yang tidak disebutkan.'].filter(Boolean).join('\n');
+}
+function entityPromptText(key,d){
+  const [kind,id]=key.split(':');
+  if(kind==='char'){const c=d.entities.characters.find(x=>x.id===id);return c?characterPrompt(c,d):''}
+  if(kind==='loc'){const l=d.entities.locations.find(x=>x.id===id);return l?d.visualPrompts[key]??locationPromptDefault(l,d):''}
+  if(kind==='prod'){const p=d.entities.products.find(x=>x.id===id);return p?d.visualPrompts[key]??productPromptDefault(p,d):''}
+  return '';
+}
 function characterPrompt(c,d){return d.visualPrompts['char:'+c.id]??characterPromptDefault(c,d)}
 function scenePrompt(s,d){return d.visualPrompts['scene:'+s.id]??scenePromptDefault(s,d)}
 function sceneVisualStatus(s,d){
@@ -106,18 +127,33 @@ function referenceCardHtml(kind,e,d,subtitle,prompt=''){
 function referenceEntitiesHtml(d){
   const locs=d.entities.locations, prods=d.entities.products;
   if(!locs.length&&!prods.length)return '';
-  const locCards=locs.map(l=>referenceCardHtml('locations',l,d,'Lokasi: gambar referensi dipakai untuk adegan yang memilih lokasi ini.')).join('');
-  const prodCards=prods.map(p=>referenceCardHtml('products',p,d,'Produk: gambar referensi dipakai untuk adegan yang memilih produk ini.')).join('');
+  const locCards=locs.map(l=>referenceCardHtml('locations',l,d,'Lokasi: gambar referensi dipakai untuk adegan yang memilih lokasi ini.',entityPromptHtml(`loc:${l.id}`,entityPromptText(`loc:${l.id}`,d),'Prompt referensi lokasi untuk Gemini (boleh diubah)'))).join('');
+  const prodCards=prods.map(p=>referenceCardHtml('products',p,d,'Produk: gambar referensi dipakai untuk adegan yang memilih produk ini.',entityPromptHtml(`prod:${p.id}`,entityPromptText(`prod:${p.id}`,d),'Prompt referensi produk untuk Gemini (boleh diubah)'))).join('');
   return `<section class="sheet-section"><div class="eyebrow">REFERENSI LOKASI & PRODUK · GEMINI MANUAL</div><h3>Gambar referensi</h3><p class="saved-hint">Unggah gambar hasil Gemini ke lokasi atau produk yang sesuai. Satu lokasi atau produk bisa punya lebih dari satu gambar.</p>${locCards}${prodCards}</section>`;
+}
+function entityPromptHtml(key,text,label){
+  return `<label class="field-label">${esc(label)}</label><textarea class="input" rows="6" data-entity-prompt="${esc(key)}">${esc(text)}</textarea><div class="sheet-actions"><button class="soft-button" data-copy-entity="${esc(key)}">Salin prompt</button><a class="primary" href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer">Buka Gemini ↗</a><button class="soft-button" data-reset-prompt="${esc(key)}">Pulihkan prompt awal</button></div>`;
 }
 function characterSheetCard(c,d){
   const prompt=`<label class="field-label">Prompt untuk Gemini (boleh diubah)</label><textarea class="input" rows="6" data-char-prompt="${esc(c.id)}">${esc(characterPrompt(c,d))}</textarea><div class="sheet-actions"><button class="soft-button" data-copy-char="${esc(c.id)}">Salin prompt</button><a class="primary" href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer">Buka Gemini ↗</a><button class="soft-button" data-reset-prompt="char:${esc(c.id)}">Pulihkan prompt awal</button></div>`;
   return referenceCardHtml('characters',c,d,c.role||'Peran belum diisi',`<div class="sheet-facts"><b>Penampilan</b><span>${esc(c.appearance||'belum diisi')}</span><b>Ciri khas</b><span>${esc(c.signature||'belum diisi')}</span></div>${prompt}`);
 }
 
+function sceneAttachHtml(s,d){
+  const items=[
+    ...(s.characterIds||[]).map(id=>d.entities.characters.find(c=>c.id===id)).filter(Boolean).map(c=>['Karakter',c.name,characterRefs(d,c.id)]),
+    ...[d.entities.locations.find(l=>l.id===s.locationId)].filter(Boolean).map(l=>['Lokasi',l.name,entityRefs(d,'locations',l.id)]),
+    ...(s.productIds||[]).map(id=>(d.entities.products||[]).find(p=>p.id===id)).filter(Boolean).map(p=>['Produk',p.name,entityRefs(d,'products',p.id)]),
+  ];
+  if(!items.length)return '<p class="saved-hint">Adegan ini belum punya tokoh, lokasi, atau produk yang tertaut, jadi tidak ada gambar referensi yang perlu dilampirkan.</p>';
+  const lines=items.map(([kind,name,refs])=>refs.length
+    ?`<li><b>${kind} ${esc(name||'Tanpa nama')}</b>: lampirkan ${refs.map(a=>esc(visualLabelText(a.label))).join(', ')} (${refs.length} gambar)</li>`
+    :`<li><b>${kind} ${esc(name||'Tanpa nama')}</b>: belum ada gambar referensi, tambahkan dulu di bagian referensi</li>`).join('');
+  return `<div class="field-label">Lampirkan di Gemini sebelum meminta gambar adegan</div><ul class="attach-list">${lines}</ul>`;
+}
 function sceneVisualHtml(s,d){
   const status=sceneVisualStatus(s,d);
-  return `<section class="asset-links visual-block"><div class="eyebrow">GAMBAR ADEGAN · GEMINI MANUAL</div><p class="sub"><b>Status:</b> ${visualStatusText[status]}</p><p class="saved-hint">Langkah: salin prompt → buka Gemini → buat gambar dan unduh → unggah di bawah.</p><label class="field-label">Prompt gambar (boleh diubah sebelum disalin)</label><textarea class="input" rows="5" data-scene-prompt="${esc(s.id)}">${esc(scenePrompt(s,d))}</textarea><div class="sheet-actions"><button class="soft-button" data-copy-scene="${esc(s.id)}">Salin prompt</button><a class="primary" href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer">Buka Gemini ↗</a><button class="soft-button" data-reset-prompt="scene:${esc(s.id)}">Pulihkan prompt awal</button></div><label class="field-label">Unggah gambar hasil Gemini untuk adegan ini</label><input type="file" accept="image/png,image/jpeg,image/webp" data-scene-upload="${esc(s.id)}"></section>`;
+  return `<section class="asset-links visual-block"><div class="eyebrow">GAMBAR ADEGAN · GEMINI MANUAL</div><p class="sub"><b>Status:</b> ${visualStatusText[status]}</p><p class="saved-hint">Langkah: salin prompt → buka Gemini → buat gambar dan unduh → unggah di bawah.</p>${sceneAttachHtml(s,d)}<label class="field-label">Prompt gambar (boleh diubah sebelum disalin)</label><textarea class="input" rows="5" data-scene-prompt="${esc(s.id)}">${esc(scenePrompt(s,d))}</textarea><div class="sheet-actions"><button class="soft-button" data-copy-scene="${esc(s.id)}">Salin prompt</button><a class="primary" href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer">Buka Gemini ↗</a><button class="soft-button" data-reset-prompt="scene:${esc(s.id)}">Pulihkan prompt awal</button></div><label class="field-label">Unggah gambar hasil Gemini untuk adegan ini</label><input type="file" accept="image/png,image/jpeg,image/webp" data-scene-upload="${esc(s.id)}"></section>`;
 }
 function sceneCard(s,i){return sceneCardBase(s,i).replace(/<\/article>$/,sceneVisualHtml(s,ensureData())+'</article>')}
 function sceneCardBase(s,i){const assets=ensureData().assets,a=normalizeSceneAudio(s),dialogue=a.dialogue[0]||{speakerName:'',speakerId:'',voiceProfileId:'',voiceProfile:'',text:'',emotion:'',delivery:''},estimate=audioSpeechEstimate(s);return `<article class="scene-card" data-scene="${i}"><div class="scene-top"><span class="scene-number">ADEGAN ${String(i+1).padStart(2,'0')}</span><div><button class="soft-button" data-move="up" data-index="${i}" ${i===0?'disabled':''}>↑</button> <button class="soft-button" data-move="down" data-index="${i}" ${i===ensureData().scenes.length-1?'disabled':''}>↓</button> <button class="scene-delete" data-delete-scene="${i}">Hapus</button></div></div><label>Judul<input data-field="title" value="${esc(s.title||'')}"></label><div class="scene-fields"><label>Tujuan adegan<input data-field="purpose" value="${esc(s.purpose||'')}"></label><label>Lokasi<input data-field="location" value="${esc(s.location||'')}"></label><label>Waktu<input data-field="time" value="${esc(s.time||'')}"></label><label>Aksi<textarea data-field="action">${esc(s.action||'')}</textarea></label><label>Visual yang terlihat<textarea data-field="visual">${esc(s.visual||'')}</textarea></label><label>Ekspresi<textarea data-field="expression">${esc(s.expression||'')}</textarea></label><label>Framing / gerak kamera<textarea data-field="camera">${esc(s.camera||'')}</textarea></label><label>Pencahayaan<input data-field="lighting" value="${esc(s.lighting||'')}"></label><label>Durasi target<input data-field="duration" value="${esc(s.duration||'5 detik')}"></label></div><section class="asset-links audio-plan"><h3>Audio & suara</h3><label class="check-row"><input type="checkbox" data-audio-required ${a.required?'checked':''}><span>Adegan ini memerlukan rencana audio</span></label><div class="scene-fields"><label>Nama pembicara<input data-audio="dialogue.speakerName" value="${esc(dialogue.speakerName)}" placeholder="Nama pembicara"></label><label>ID pembicara<input data-audio="dialogue.speakerId" value="${esc(dialogue.speakerId)}" placeholder="ID karakter bila ada"></label><label>ID profil suara konsisten<input data-audio="dialogue.voiceProfileId" value="${esc(dialogue.voiceProfileId)}" placeholder="contoh: ayah-id-01"></label><label>Ciri suara<textarea data-audio="dialogue.voiceProfile" placeholder="Nada, aksen, usia suara">${esc(dialogue.voiceProfile)}</textarea></label><label>Emosi dan penyampaian<input data-audio="dialogue.emotion" value="${esc(dialogue.emotion)}" placeholder="hangat, tenang"></label><label>Teks dialog<textarea data-audio="dialogue.text">${esc(dialogue.text)}</textarea></label><label>Narator / VO<input data-audio="voiceover.narratorName" value="${esc(a.voiceover.narratorName)}" placeholder="Nama atau identitas narator"></label><label>ID suara narator<input data-audio="voiceover.voiceProfileId" value="${esc(a.voiceover.voiceProfileId)}" placeholder="contoh: narator-hangat-01"></label><label>Ciri suara narator<textarea data-audio="voiceover.voiceProfile">${esc(a.voiceover.voiceProfile)}</textarea></label><label>Emosi dan penyampaian narator<input data-audio="voiceover.emotion" value="${esc(a.voiceover.emotion)}" placeholder="reflektif, pelan"></label><label>Teks narasi / VO<textarea data-audio="voiceover.text">${esc(a.voiceover.text)}</textarea></label><label>Suasana latar, satu per baris<textarea data-audio-list="ambience">${esc(a.ambience.join('\n'))}</textarea></label><label>Efek suara, satu per baris<textarea data-audio-list="soundEffects">${esc(a.soundEffects.join('\n'))}</textarea></label><label>Musik<textarea data-audio="music.description">${esc(a.music.description)}</textarea></label><label>Mood / suasana musik<input data-audio="music.mood" value="${esc(a.music.mood)}"></label><label>ID kesinambungan musik<input data-audio="music.continuityId" value="${esc(a.music.continuityId)}"></label><label>Transisi musik<input data-audio="music.transition" value="${esc(a.music.transition)}"></label></div><p class="saved-hint" data-audio-estimate>Perkiraan ucapan: ${estimate.speechSeconds} detik${estimate.overLimit?' — kemungkinan melebihi durasi klip.':''} (perkiraan kasar).</p></section>${sceneEntityLinks(s,i)}<div class="asset-links"><b>Referensi untuk adegan</b>${assets.length?assets.map(a=>`<label class="check-row"><input type="checkbox" data-asset-link="${esc(a.id)}" ${(s.referenceAssetIds||s.assetIds||[]).includes(a.id)?'checked':''}><span>${esc(a.name)} · ${esc(a.type||a.category||'Referensi umum')}</span></label>`).join(''):'<p class="saved-hint">Belum ada aset. Tambahkan di langkah Aset.</p>'}</div></article>`}
@@ -468,9 +504,10 @@ async function replaceReference(oldId,file){
 function visualClick(e){
   const t=e.target;
   if(t.id==='add-product'){const d=ensureData();d.entities.products.push({id:entityId('prod'),name:'',description:'',source:'manual'});scheduleSave();renderTab();return true}
-  if(!t.dataset?.copyChar&&!t.dataset?.copyScene&&!t.dataset?.resetPrompt)return false;
+  if(!t.dataset?.copyChar&&!t.dataset?.copyScene&&!t.dataset?.copyEntity&&!t.dataset?.resetPrompt)return false;
   const d=ensureData();
   if(t.dataset?.copyChar){const c=d.entities.characters.find(x=>x.id===t.dataset.copyChar);if(c)copy(characterPrompt(c,d));return true}
+  if(t.dataset?.copyEntity){copy(entityPromptText(t.dataset.copyEntity,d));return true}
   if(t.dataset?.copyScene){const s=d.scenes.find(x=>x.id===t.dataset.copyScene);if(!s)return true;copy(scenePrompt(s,d));d.visualState['scene:'+s.id]={copiedAt:new Date().toISOString()};scheduleSave();renderTab();return true}
   if(t.dataset?.resetPrompt){delete d.visualPrompts[t.dataset.resetPrompt];scheduleSave();renderTab();return true}
   return false;
@@ -489,8 +526,9 @@ function visualChange(e){
 
 function visualInput(e){
   const t=e.target;
-  if(t.dataset?.charPrompt===undefined&&t.dataset?.scenePrompt===undefined)return false;
+  if(t.dataset?.charPrompt===undefined&&t.dataset?.scenePrompt===undefined&&t.dataset?.entityPrompt===undefined)return false;
   const d=ensureData();
+  if(t.dataset?.entityPrompt!==undefined){d.visualPrompts[t.dataset.entityPrompt]=t.value;scheduleSave();return true}
   if(t.dataset?.charPrompt!==undefined){d.visualPrompts['char:'+t.dataset.charPrompt]=t.value;scheduleSave();return true}
   if(t.dataset?.scenePrompt!==undefined){d.visualPrompts['scene:'+t.dataset.scenePrompt]=t.value;scheduleSave();return true}
   return false;

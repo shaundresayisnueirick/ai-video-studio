@@ -75,6 +75,7 @@ input[type=checkbox]{min-height:0;width:20px;height:20px;padding:0;margin-top:2p
 .sheet-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0}
 .ref-list{list-style:none;padding:0;margin:8px 0;display:grid;gap:6px;font-size:14px}
 .ref-list li{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.attach-list{margin:6px 0 10px;padding-left:18px;font-size:14px;line-height:1.6;overflow-wrap:anywhere}
 .visual-block{margin-top:12px}
 @media(max-width:640px){.sheet-facts{grid-template-columns:1fr}.sheet-facts b{margin-top:6px}.sheet-actions .soft-button,.sheet-actions .primary{width:100%;text-align:center}}
 .visual-block input[type=file],.sheet-card input[type=file]{display:block;width:100%;max-width:100%;margin-top:6px}

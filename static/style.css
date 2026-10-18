@@ -21,6 +21,36 @@ button,.primary,.outline,.soft-button,.nav-item,.input,select,input{min-height:4
 .wizard-bar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:visible;margin-right:0}
 .wizard-step{white-space:normal;text-align:left;line-height:1.35;min-height:44px}
 }
+/* Paket produksi (B2): daftar klip, aset, dan peringatan */
+.pkg-section{margin-top:8px}
+.pkg-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px}
+.pkg-block{margin-top:22px}
+.pkg-block h3{font-size:16px;margin:0 0 10px}
+.pkg-list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.pkg-list li{display:grid;gap:6px;padding:12px;border:1px solid #e6e9e3;border-radius:10px;background:#fff}
+.pkg-list small{color:var(--muted);line-height:1.5;overflow-wrap:anywhere}
+.pkg-order-list li{grid-template-columns:auto 1fr auto;align-items:center}
+.pkg-order{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:50%;background:#eef3ef;font-weight:600}
+.pkg-status{font-size:13px;padding:4px 10px;border-radius:999px;background:#f5f1e6;color:#6b5a2e;white-space:nowrap;justify-self:start}
+.pkg-status.uploaded{background:#e6f1ea;color:#2e5d4a}
+.pkg-clip{margin-top:12px;padding:16px;border:1px solid #e6e9e3;border-radius:12px;background:#fff;display:grid;gap:12px}
+.pkg-facts{display:grid;grid-template-columns:minmax(90px,max-content) minmax(0,1fr);gap:6px 12px;margin:0;font-size:14px;line-height:1.5}
+.pkg-facts dt{color:var(--muted)}
+.pkg-facts dd{margin:0;overflow-wrap:anywhere}
+.pkg-facts small{display:block;color:var(--muted)}
+.pkg-prompt{display:grid;gap:8px;padding:12px;border-radius:10px;background:#f6f8f5}
+.pkg-prompt p{margin:0;font-size:14px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.pkg-warning{margin:12px 0;padding:10px 12px;border-radius:8px;background:#fff4e8;color:#7a4a1c;font-size:14px;line-height:1.5}
+.pkg-error{margin-top:18px;padding:16px;border-radius:12px;border:1px solid #e9b6a0;background:#fdf1ec;display:grid;gap:8px}
+.pkg-link{display:grid;gap:4px}
+.pkg-idea{margin:6px 0 12px;padding:10px 12px;border:1px solid #e6e9e3;border-radius:8px;background:#fff;font-size:14px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto}
+.pkg-advanced{margin-top:22px}
+.pkg-advanced summary{cursor:pointer;min-height:44px;display:flex;align-items:center}
+@media(max-width:780px){
+.pkg-facts{grid-template-columns:1fr}
+.pkg-order-list li{grid-template-columns:auto minmax(0,1fr)}
+.pkg-order-list .pkg-status{grid-column:2}
+}
 .side-panel textarea,.side-panel input{width:100%;margin-top:6px;border:1px solid #e4e8e2;border-radius:7px;padding:10px 11px;font-size:14px;color:#36413b;background:#fff}
 .scene-card input,.scene-card textarea,.check-scene input{border:1px solid #e4e8e2;border-radius:7px;padding:10px 11px;font-size:14px;color:#36413b;background:#fff;font-family:inherit}
 .draft-actions>button{flex:1 1 200px}

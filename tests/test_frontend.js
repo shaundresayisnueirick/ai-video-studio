@@ -12,7 +12,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl } = {}) {
+function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipboardImpl } = {}) {
   const elements = new Map();
   const session = new Map();
   const handlers = {};
@@ -43,14 +43,14 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl } = {})
   });
   const context = vm.createContext({
     document, window: { scrollTo() { scrolls++; } }, crypto: { randomUUID: () => `id-${Math.random()}` },
-    navigator: { clipboard: { writeText: async () => {} } }, sessionStorage: storage,
+    navigator: { clipboard: { writeText: clipboardImpl || (async () => {}) } }, sessionStorage: storage,
     setTimeout: () => 1, clearTimeout() {}, confirm: message => { confirms++; confirmMessages.push(message); return confirmImpl ? confirmImpl(message) : true; }, prompt: () => null,
     fetch, console,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../static/app.js'), 'utf8'), context);
-  function click({ id, tab, view, open, deleteAsset, linkAll } = {}) {
+  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang } = {}) {
     const target = {
-      id, dataset: { deleteAsset, linkAll },
+      id, dataset: { deleteAsset, linkAll, copyClip, copyLang },
       closest(selector) {
         if (selector === '[data-tab]' && tab) return { dataset: { tab } };
         if (selector === '[data-view]' && view) return { dataset: { view } };
@@ -62,6 +62,7 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl } = {})
   }
   return {
     context, elements, session, click, confirmMessages,
+    change: target => handlers.change({ target }),
     element: selector => document.querySelector(selector),
     getScrolls: () => scrolls, getConfirms: () => confirms,
   };
@@ -673,4 +674,508 @@ test('autosave keeps the live project data object so writes made through an earl
   const put = calls.filter(call => call.options?.method === 'PUT').at(-1);
   assert.equal(JSON.parse(put.options.body).data.promptScene, 1);
   assert.equal(vm.runInContext('current.data.promptScene', context), 1);
+});
+
+// Production package (B2): UI behaviour on top of the B1 endpoints. Gemini is always mocked.
+const samplePackage = () => ({
+  model: 'flow-default', concept: 'Kopi pagi dalam dua klip.', total_seconds: 15,
+  warnings: ['Batas 10 detik untuk Google Flow (konfigurasi awal) belum diverifikasi.'],
+  characters: [{ id: 'char-barista', name: 'Rani', role: 'barista', appearance: 'celemek hijau' }],
+  products: [{ id: 'prod-kopi', name: 'Kopi kemasan' }],
+  locations: [{ id: 'loc-kedai', name: 'Kedai', description: 'kayu hangat' }],
+  image_requirements: [{ id: 'img-rani', purpose: 'karakter', subject: 'char-barista', description: 'wajah Rani', generation: 'manual', asset_id: null, status: 'needed' }],
+  clips: [
+    { index: 1, duration_seconds: 6, prompt_final: 'Close-up kemasan kopi di meja kayu.', prompt_en: 'Close-up of a coffee pack on a wooden table.', en: { action: 'Hands open the pack', camera: 'close-up', lighting: 'morning light', audio_text: 'soft music' }, action: 'Tangan membuka kemasan', camera: 'close-up', lighting: 'cahaya pagi', references: [{ kind: 'requirement', id: 'img-rani', role: 'karakter' }], characters: ['char-barista'], locations: ['loc-kedai'], audio: { plan: 'musik', text: '', note: 'musik lembut' }, continues_from: null },
+    { index: 2, duration_seconds: 9, prompt_final: 'Tangan menuang kopi, uap naik.', prompt_en: 'Hands pour coffee, steam rises.', en: { action: 'Pouring', camera: 'medium shot', lighting: 'warm light', audio_text: '' }, action: 'Menuang', camera: 'medium shot', lighting: 'hangat', references: [{ kind: 'asset', id: 'a-produk', role: 'produk' }], characters: [], locations: [], audio: { plan: 'efek', text: '', note: '' }, continues_from: 1 },
+  ],
+  upload_checklist: [
+    { order: 1, kind: 'requirement', id: 'img-rani', name: 'karakter', role: 'karakter', first_clip: 1, status: 'needed' },
+    { order: 2, kind: 'asset', id: 'a-produk', name: 'kopi-kemasan.png', role: 'produk', first_clip: 2, status: 'uploaded' },
+  ],
+});
+const savedView = pkg => ({ schemaVersion: 1, savedAt: '2026-10-17T00:00:00+00:00', targetSeconds: 15, package: pkg, error: null });
+const confirmedUnderstanding = () => ({
+  status: 'confirmed', ideaAtConfirm: 'Kopi pagi', core: 'Kopi pagi yang hangat.', message: '',
+  characters: [], locations: [], sequence: [], unclear: [], suggestions: [],
+});
+function packageProject(view, understanding = confirmedUnderstanding()) {
+  const p = project('p1');
+  p.idea = 'Kopi pagi';
+  p.data.duration = '30 detik';
+  p.data.assets = [{ id: 'a-produk', name: 'kopi-kemasan.png', type: 'Produk', url: '/uploads/a.png' }];
+  if (understanding) p.data.understanding = understanding;
+  if (view) p.data.productionPackage = view;
+  return p;
+}
+const openPackageTab = (context, p) => vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='package';renderProject()`, context);
+
+test('package tab enables Gemini generation only when the server reports a key', async () => {
+  let configured = false;
+  const { context, element } = appContext({
+    fetchImpl: async url => (url === '/api/ai/gemini/status' ? response({ configured, source: null }) : response({})),
+  });
+  openPackageTab(context, packageProject());
+  await tick();
+  assert.equal(element('#build-package').disabled, true);
+  assert.match(element('#package-status').textContent, /GEMINI_API_KEY belum terbaca/);
+  configured = true;
+  await vm.runInContext('refreshPackageProvider()', context);
+  assert.equal(element('#build-package').disabled, false);
+});
+
+test('building a package sends only the idea and project id, shows a review, and saves nothing until confirmed', async () => {
+  const calls = [];
+  const pkg = samplePackage();
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      if (url === '/api/ai/production') return response({ package: pkg });
+      if (url.endsWith('/production-package')) return response({ ...project('p1'), data: { ...project('p1').data, productionPackage: savedView(JSON.parse(options.body).package) } });
+      return response(url === "/api/projects" ? [] : {});
+    },
+  });
+  openPackageTab(context, packageProject());
+  await tick();
+  await click({ id: 'build-package' });
+  const body = JSON.parse(calls.find(call => call.url === '/api/ai/production').options.body);
+  assert.equal(body.project_id, 'p1');
+  assert.equal(body.idea, 'Kopi pagi');
+  assert.equal(body.include_images, false);
+  assert.equal(body.model_key, 'flow-default');
+  assert.equal(calls.some(call => call.options?.method === 'PUT'), false, 'nothing is saved before confirmation');
+  assert.match(element('#tab-content').innerHTML, /Tinjau paket sebelum disimpan/);
+
+  await click({ id: 'save-package' });
+  const saves = calls.filter(call => call.options?.method === 'PUT');
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].url, '/api/projects/p1/production-package');
+  const saveBody = JSON.parse(saves[0].options.body);
+  assert.equal(saveBody.targetSeconds, 30);
+  assert.equal(saveBody.package.concept, pkg.concept);
+  assert.equal(calls.some(call => call.url === '/api/projects/p1' && call.options?.method === 'PUT'), false, 'the project data endpoint is not used for the package');
+  assert.equal(vm.runInContext('packageDraft', context), null);
+  assert.equal(vm.runInContext('current.data.productionPackage.package.concept', context), pkg.concept);
+  assert.match(element('#tab-content').innerHTML, /TERSIMPAN DI PROYEK INI/);
+});
+
+test('a saved package reopens after reload with clips, camera, lighting, audio, references, and upload status', async () => {
+  const serverProject = packageProject(savedView(samplePackage()));
+  const { context, element } = appContext({ projects: [serverProject] });
+  await tick();
+  vm.runInContext("openProject('p1')", context);
+  vm.runInContext("setTab('package')", context);
+  const html = element('#tab-content').innerHTML;
+  for (const text of ['Klip 1', 'Klip 2', 'close-up', 'medium shot', 'cahaya pagi', 'Musik', 'Efek suara', 'Rani', 'Kopi kemasan', 'lanjutan dari klip 1', 'kebutuhan "karakter"', 'kopi-kemasan.png', 'Perlu diunggah', 'Sudah diunggah', 'Salin prompt Indonesia · klip 2', 'Salin prompt Inggris · klip 2']) {
+    assert.ok(html.includes(text), `missing: ${text}`);
+  }
+  assert.ok(html.includes('data-copy-clip="2"'));
+  assert.ok(html.includes('Batas 10 detik'), 'unverified model warning stays visible');
+  assert.equal(html.includes('Gambar tidak ditemukan'), false);
+});
+
+test('copy button copies the clip prompt in the chosen language with its structured details', async () => {
+  const copied = [];
+  const { context, element, click } = appContext({ clipboardImpl: async text => { copied.push(text); } });
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  await click({ copyClip: '2', copyLang: 'id' });
+  await tick();
+  assert.ok(copied[0].startsWith('Tangan menuang kopi, uap naik.'));
+  assert.ok(copied[0].includes('Detail produksi:'));
+  assert.ok(copied[0].includes('- Kamera: medium shot'));
+  assert.ok(copied[0].includes('- Pencahayaan: hangat'));
+  assert.ok(copied[0].includes('lanjutan dari klip 1'));
+  await click({ copyClip: '2', copyLang: 'en' });
+  await tick();
+  assert.ok(copied[1].startsWith('Hands pour coffee, steam rises.'));
+  assert.ok(copied[1].includes('Production details:'));
+  assert.ok(copied[1].includes('- Camera: medium shot'));
+  assert.ok(copied[1].includes('- Lighting: warm light'));
+  assert.match(element('#toast').textContent, /Tersalin/);
+});
+
+test('an invalid stored package shows a clear warning and offers only removal', async () => {
+  const stored = { schemaVersion: 1, savedAt: null, targetSeconds: null, package: null, error: 'Paket tersimpan tidak lolos validasi: Klip 1 berdurasi 15 detik, melebihi batas 10 detik. Data tersimpan tidak diubah.' };
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject(stored));
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Paket tersimpan tidak bisa dipakai/);
+  assert.ok(html.includes('melebihi batas 10 detik'));
+  assert.ok(html.includes('id="clear-package"'));
+  assert.equal(html.includes('PROMPT FINAL'), false);
+  assert.equal(html.includes('Salin prompt klip'), false);
+});
+
+test('choosing an image for a requirement saves only the package and marks it uploaded', async () => {
+  const calls = [];
+  const { context, element, change } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith('/production-package')) return response({ ...project('p1'), data: { ...project('p1').data, productionPackage: savedView(JSON.parse(options.body).package) } });
+      return response(url === "/api/projects" ? [] : {});
+    },
+  });
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  assert.ok(element('#tab-content').innerHTML.includes('<option value="a-produk"'));
+  await change({ dataset: { linkRequirement: 'img-rani' }, value: 'a-produk' });
+  await tick();
+  await tick();
+  const save = calls.find(call => call.options?.method === 'PUT');
+  assert.equal(save.url, '/api/projects/p1/production-package');
+  const linked = JSON.parse(save.options.body).package.image_requirements[0];
+  assert.equal(linked.asset_id, 'a-produk');
+  assert.equal(linked.status, 'uploaded');
+  assert.equal(calls.some(call => call.url === '/api/projects/p1' && call.options?.method === 'PUT'), false);
+  assert.match(element('#tab-content').innerHTML, /Sudah diunggah/);
+});
+
+test('a failed save keeps the review draft and reports that nothing changed', async () => {
+  const pkg = samplePackage();
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      if (url === '/api/ai/production') return response({ package: pkg });
+      if (url.endsWith('/production-package')) return { ok: false, status: 500, json: async () => ({ error: 'Gagal menyimpan paket produksi. Data proyek tidak berubah.' }) };
+      return response(url === "/api/projects" ? [] : {});
+    },
+  });
+  openPackageTab(context, packageProject());
+  await tick();
+  await click({ id: 'build-package' });
+  await click({ id: 'save-package' });
+  assert.match(element('#toast').textContent, /Paket belum tersimpan: Gagal menyimpan paket produksi/);
+  assert.notEqual(vm.runInContext('packageDraft', context), null, 'draft stays available for a retry');
+  assert.match(element('#tab-content').innerHTML, /Tinjau paket sebelum disimpan/);
+  assert.equal(vm.runInContext('current.data.productionPackage', context), undefined);
+});
+
+test('a project created before packages existed shows the empty state without any error', async () => {
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject());
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.ok(html.includes('Belum ada paket produksi'));
+  assert.equal(html.includes('pkg-error'), false);
+});
+
+test('advanced JSON is collapsed by default and the page does not claim generated images or video', async () => {
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.ok(html.includes('<details class="pkg-advanced">'));
+  assert.equal(/<details class="pkg-advanced"[^>]*open/.test(html), false);
+  assert.ok(html.includes('Aplikasi ini belum membuat gambar atau video'));
+  assert.equal(/(gambar|video|audio)\s+(sudah|telah)\s+dibuat/i.test(html), false);
+});
+
+test('a draft that refers to a removed upload warns before it can be saved', async () => {
+  const pkg = samplePackage();
+  pkg.clips[1].references = [{ kind: 'asset', id: 'a-hilang', role: 'produk' }];
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject());
+  vm.runInContext(`packageDraft=${JSON.stringify(pkg)};renderTab()`, context);
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /tidak ada lagi di daftar unggahan/);
+});
+
+test('restoring an unsaved draft keeps the package the server saved, not the older copy in the backup', async () => {
+  const serverProject = packageProject(savedView(samplePackage()));
+  const staleBackup = { ...packageProject(savedView({ ...samplePackage(), concept: 'Konsep lama' })), idea: 'Draf lain' };
+  const { context, session } = appContext({ projects: [serverProject], confirmImpl: () => true });
+  session.set('ai-video-studio:unsaved:p1', JSON.stringify(staleBackup));
+  await tick();
+  vm.runInContext("openProject('p1')", context);
+  assert.equal(vm.runInContext('current.idea', context), 'Draf lain');
+  assert.equal(vm.runInContext('current.data.productionPackage.package.concept', context), samplePackage().concept);
+});
+
+// Understanding first, package second (B3 fidelity work).
+test('understanding is requested with the user details, corrected by the user, and only then confirmed', async () => {
+  const calls = [];
+  const summary = { core: 'Rani menolong kucing.', message: 'Keberanian kecil.', characters: ['Rani — remaja: penolong'], locations: ['Kota kecil — sore hujan'], sequence: ['1. Rani menemukan kucing'], unclear: ['Akhir cerita'], suggestions: ['Musik lembut'] };
+  const p = packageProject(null, null);
+  p.data.character = 'Rani, remaja berambut ikal';
+  p.data.world = 'kota kecil';
+  p.data.message = 'keberanian';
+  const { context, element, click, change } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      if (url === '/api/ai/understanding') return response({ understanding: summary });
+      if (options?.method === 'PUT') return response(JSON.parse(options.body));
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  openPackageTab(context, p);
+  await tick();
+  assert.equal(element('#build-package').disabled, true);
+  await click({ id: 'build-understanding' });
+  await tick();
+  const body = JSON.parse(calls.find(call => call.url === '/api/ai/understanding').options.body);
+  assert.equal(body.character, 'Rani, remaja berambut ikal');
+  assert.equal(body.world, 'kota kecil');
+  assert.equal(body.message, 'keberanian');
+  assert.equal(calls.some(call => call.url === '/api/ai/production'), false, 'no package before confirmation');
+  assert.match(element('#tab-content').innerHTML, /data-understanding-field="sequence"/);
+  change({ dataset: { understandingField: 'sequence' }, value: '1. Rani menemukan kucing\n2. Kucing ikut pulang' });
+  await click({ id: 'confirm-understanding' });
+  await tick();
+  const saves = calls.filter(call => call.url === '/api/projects/p1' && call.options?.method === 'PUT');
+  const saved = JSON.parse(saves[saves.length - 1].options.body).data.understanding;
+  assert.equal(saved.status, 'confirmed');
+  assert.equal(saved.ideaAtConfirm, 'Kopi pagi');
+  assert.deepEqual(saved.sequence, ['1. Rani menemukan kucing', '2. Kucing ikut pulang']);
+  assert.match(element('#tab-content').innerHTML, /Pemahaman sudah dikonfirmasi/);
+  await tick();
+  assert.equal(element('#build-package').disabled, false);
+});
+
+test('package generation stays blocked until the understanding is confirmed', async () => {
+  const calls = [];
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  openPackageTab(context, packageProject(null, { status: 'draft', core: 'Inti', message: '', characters: [], locations: [], sequence: [], unclear: [], suggestions: [] }));
+  await tick();
+  assert.equal(element('#build-package').disabled, true);
+  await click({ id: 'build-package' });
+  assert.equal(calls.some(call => call.url === '/api/ai/production'), false);
+  assert.match(element('#toast').textContent, /Konfirmasi pemahaman/);
+});
+
+test('changing the idea after confirmation asks for a new confirmation before a package is made', async () => {
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject(null, { ...confirmedUnderstanding(), ideaAtConfirm: 'Ide lama' }));
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /Ide sudah berubah sejak pemahaman dikonfirmasi/);
+  assert.equal(element('#build-package').disabled, true);
+});
+
+test('each clip offers an Indonesian and an English prompt and names the English details still missing', async () => {
+  const copied = [];
+  const pkg = samplePackage();
+  pkg.clips[1].en = { action: 'Pouring' };
+  const { context, element, click } = appContext({ clipboardImpl: async text => { copied.push(text); } });
+  openPackageTab(context, packageProject(savedView(pkg)));
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.ok(html.includes('Salin prompt Inggris · klip 1'));
+  assert.ok(html.includes('Prompt Inggris belum lengkap:'));
+  assert.ok(html.includes('klip 2: Camera, Lighting'));
+  await click({ copyClip: '1', copyLang: 'en' });
+  await tick();
+  assert.ok(copied[0].includes('- Lighting: morning light'));
+});
+
+test('a package saved before English prompts existed shows that English is not available yet', async () => {
+  const pkg = samplePackage();
+  pkg.clips.forEach(clip => { clip.prompt_en = ''; clip.en = {}; });
+  const { context, element } = appContext();
+  openPackageTab(context, packageProject(savedView(pkg)));
+  await tick();
+  assert.ok(element('#tab-content').innerHTML.includes('Belum tersedia untuk paket ini'));
+});
+
+test('the idea is shown in full, not cut', async () => {
+  const longIdea = 'Rani menolong kucing tersesat di kota kecil. '.repeat(8).trim();
+  const p = packageProject();
+  p.idea = longIdea;
+  const { context, element } = appContext();
+  openPackageTab(context, p);
+  await tick();
+  assert.ok(element('#tab-content').innerHTML.includes(longIdea));
+});
+
+test('the story draft request carries the characters, location, and message typed on the Ide form', async () => {
+  const calls = [];
+  const existing = project();
+  existing.idea = 'Rani menolong kucing';
+  existing.data.character = 'Rani, remaja berambut ikal';
+  existing.data.world = 'kota kecil';
+  existing.data.message = 'keberanian kecil';
+  const { context, element } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/story') return response({ draft: { alternatives: [{ title: 'A', scenes: [] }] } });
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  vm.runInContext(`current=${JSON.stringify(existing)};projects=[current];activeTab='idea'`, context);
+  element('#ai-provider').value = 'gemini';
+  element('#idea-input').value = 'Rani menolong kucing';
+  element('#duration-input').value = '30 detik';
+  element('#style-input').value = 'Sinematik natural';
+  await vm.runInContext('requestAIDraft()', context);
+  const payload = JSON.parse(calls.find(call => call.url === '/api/ai/story').options.body);
+  assert.equal(payload.character, 'Rani, remaja berambut ikal');
+  assert.equal(payload.world, 'kota kecil');
+  assert.equal(payload.message, 'keberanian kecil');
+});
+
+// Repair round: duration and style, the user's own message, AI suggestions, and confirmation status.
+test('the duration and style shown on the form are the stored values and go into the story request', async () => {
+  const calls = [];
+  const p = project();
+  p.idea = 'Rani menolong kucing';
+  const { context, element } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/story') return response({ draft: { alternatives: [{ title: 'A', scenes: [] }] } });
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='idea';renderProject()`, context);
+  await tick();
+  assert.equal(vm.runInContext('current.data.duration', context), '30 detik', 'the default the form shows is stored');
+  assert.equal(vm.runInContext('current.data.style', context), 'Sinematik natural');
+  element('#duration-input').value = '2 menit';
+  element('#duration-input').onchange();
+  element('#style-input').value = 'Animasi 3D';
+  element('#style-input').onchange();
+  element('#ai-provider').value = 'gemini';
+  element('#idea-input').value = 'Rani menolong kucing';
+  await vm.runInContext('requestAIDraft()', context);
+  const body = JSON.parse(calls.find(call => call.url === '/api/ai/story').options.body);
+  assert.equal(body.duration, '2 menit');
+  assert.equal(body.style, 'Animasi 3D');
+});
+
+test('the understanding request, the package request, and the target duration all use the stored duration and style', async () => {
+  const calls = [];
+  const p = packageProject(null, null);
+  p.data.duration = '2 menit';
+  p.data.style = 'Animasi 3D';
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      if (url === '/api/ai/understanding') return response({ understanding: { core: 'Inti', message: '', characters: [], locations: [], sequence: [], unclear: [], suggestions: [], acceptedSuggestions: [] } });
+      if (url === '/api/ai/production') return response({ package: samplePackage() });
+      if (url.endsWith('/production-package')) return response({ ...project('p1'), data: { ...project('p1').data, productionPackage: savedView(JSON.parse(options.body).package) } });
+      if (options?.method === 'PUT') return response(JSON.parse(options.body));
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  openPackageTab(context, p);
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  const understanding = JSON.parse(calls.find(call => call.url === '/api/ai/understanding').options.body);
+  assert.equal(understanding.duration, '2 menit');
+  assert.equal(understanding.style, 'Animasi 3D');
+
+  vm.runInContext("current.data.understanding={...current.data.understanding,status:'confirmed',ideaAtConfirm:current.idea};renderTab()", context);
+  await tick();
+  await tick();
+  await click({ id: 'build-package' });
+  await tick();
+  const production = JSON.parse(calls.find(call => call.url === '/api/ai/production').options.body);
+  assert.equal(production.duration, '2 menit');
+  assert.equal(production.style, 'Animasi 3D');
+  await click({ id: 'save-package' });
+  await tick();
+  const save = JSON.parse(calls.filter(call => call.url.endsWith('/production-package')).pop().options.body);
+  assert.equal(save.targetSeconds, 120, 'the 2-minute choice gives a 120-second target');
+});
+
+test('applying an AI draft never replaces the user\'s own main message; the AI message is offered separately', async () => {
+  const puts = [];
+  const p = project();
+  p.idea = 'Rani menolong kucing';
+  p.data.message = 'keberanian kecil';
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      if (options?.method === 'PUT') { const body = JSON.parse(options.body); puts.push(body); return response(body); }
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='idea';aiDraftProvider='gemini';aiDraft=${JSON.stringify({ alternatives: [{ title: 'A', message: 'pesan lain dari AI', scenes: [{ title: 'Adegan 1', visual: 'Hujan' }], characters: [], locations: [] }] })};renderProject()`, context);
+  await tick();
+  await vm.runInContext('applyAIDraft()', context);
+  await tick();
+  assert.equal(vm.runInContext('current.data.message', context), 'keberanian kecil');
+  assert.equal(vm.runInContext('current.data.messageSuggestion', context), 'pesan lain dari AI');
+  assert.equal(puts[puts.length - 1].data.message, 'keberanian kecil');
+  vm.runInContext("setTab('idea')", context);
+  assert.match(element('#tab-content').innerHTML, /id="use-message-suggestion"/);
+  await click({ id: 'use-message-suggestion' });
+  await tick();
+  assert.equal(vm.runInContext('current.data.message', context), 'pesan lain dari AI', 'the user chooses the suggestion explicitly');
+});
+
+test('an AI suggestion is binding only after the user accepts it, and unaccepted ones are never sent', async () => {
+  const puts = [];
+  const calls = [];
+  const p = packageProject(null, { status: 'draft', core: 'Inti cerita', message: '', characters: [], locations: [], sequence: [], unclear: [], suggestions: ['Usulan A', 'Usulan B'], acceptedSuggestions: [] });
+  const { context, element, click, change } = appContext({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      if (url === '/api/ai/production') return response({ package: samplePackage() });
+      if (options?.method === 'PUT') { const body = JSON.parse(options.body); puts.push(body); return response(body); }
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  openPackageTab(context, p);
+  await tick();
+  const before = element('#tab-content').innerHTML;
+  assert.ok(before.includes('data-accept-suggestion="0"') && before.includes('data-accept-suggestion="1"'));
+  change({ dataset: { acceptSuggestion: '0' }, checked: true });
+  change({ dataset: { acceptSuggestion: '1' }, checked: true });
+  change({ dataset: { acceptSuggestion: '1' }, checked: false });
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.understanding.acceptedSuggestions)', context)), ['Usulan A']);
+  await click({ id: 'confirm-understanding' });
+  await tick();
+  const saved = puts[puts.length - 1].data.understanding;
+  assert.equal(saved.status, 'confirmed');
+  assert.deepEqual(saved.acceptedSuggestions, ['Usulan A']);
+  assert.match(element('#tab-content').innerHTML, /Usulan AI yang tidak dipakai: Usulan B/);
+  await tick();
+  await click({ id: 'build-package' });
+  await tick();
+  const production = calls.find(call => call.url === '/api/ai/production');
+  assert.ok(production, 'package request sent after confirmation');
+  assert.equal(production.options.body.includes('Usulan B'), false, 'the unaccepted suggestion is not sent as a binding decision');
+});
+
+test('the confirmation shows as confirmed only after the save succeeds, and a failed save can be retried', async () => {
+  let saveWorks = false;
+  const puts = [];
+  const p = packageProject(null, { status: 'draft', core: 'Inti cerita', message: '', characters: [], locations: [], sequence: [], unclear: [], suggestions: [], acceptedSuggestions: [] });
+  const { context, element, click } = appContext({
+    fetchImpl: async (url, options) => {
+      if (url === '/api/ai/gemini/status') return response({ configured: true });
+      if (options?.method === 'PUT') {
+        const body = JSON.parse(options.body);
+        puts.push(body);
+        if (!saveWorks) return { ok: false, status: 500, json: async () => ({ error: 'Gagal menyimpan' }) };
+        return response(body);
+      }
+      return response(url === '/api/projects' ? [] : {});
+    },
+  });
+  openPackageTab(context, p);
+  await tick();
+  await click({ id: 'confirm-understanding' });
+  await tick();
+  await tick();
+  assert.match(element('#toast').textContent, /belum tersimpan/);
+  assert.equal(vm.runInContext('current.data.understanding.status', context), 'draft');
+  const failed = element('#tab-content').innerHTML;
+  assert.equal(failed.includes('Pemahaman sudah dikonfirmasi'), false);
+  assert.ok(failed.includes('id="confirm-understanding"'));
+  assert.equal(element('#build-package').disabled, true, 'the package stays blocked');
+  saveWorks = true;
+  await click({ id: 'confirm-understanding' });
+  await tick();
+  assert.equal(vm.runInContext('current.data.understanding.status', context), 'confirmed');
+  assert.match(element('#tab-content').innerHTML, /Pemahaman sudah dikonfirmasi/);
+  assert.equal(puts[puts.length - 1].data.understanding.status, 'confirmed');
 });

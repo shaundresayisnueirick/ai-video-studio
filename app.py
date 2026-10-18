@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import copy
 import json
 import mimetypes
+from datetime import datetime, timezone
 import os
 import sqlite3
 import stat
@@ -14,6 +15,7 @@ import struct
 import uuid
 import urllib.request
 import urllib.error
+import production_package
 import zlib
 
 ROOT = Path(__file__).resolve().parent
@@ -74,7 +76,12 @@ def init_db():
 
 def project(row):
     item = dict(row)
-    item["data"] = normalize_production_data(json.loads(item["data"]), item)
+    data = normalize_production_data(json.loads(item["data"]), item)
+    # The saved package is owned by the server: it is written only through the production-package endpoint.
+    stored = data.pop("productionPackage", None)
+    if stored is not None:
+        data["productionPackage"] = production_package.view_for_project(stored, data["assets"])
+    item["data"] = data
     return item
 
 def _as_list(value):
@@ -481,38 +488,60 @@ def story_schema_example():
         }]
     }]}
 
-def story_prompt(idea, goal, duration, style):
+def story_prompt(idea, goal, duration, style, details=None):
     return (
-        "Buat tepat 3 alternatif konsep yang berbeda untuk ide video, masing-masing dengan 3 adegan ringkas. "
-        "Berbahasa Indonesia, mudah diproduksi, dan jangan menambah fakta penting yang tidak didukung ide. "
-        "Tulis keluaran HANYA sebagai JSON valid yang mengikuti struktur contoh ini: "
+        "Buat tepat 3 alternatif konsep untuk ide video, masing-masing dengan 3 adegan ringkas. "
+        "Ketiga alternatif harus memegang inti dan pesan utama yang sama; yang berbeda hanya cara penyajian. "
+        "Berbahasa Indonesia, mudah diproduksi, dan jangan menambah fakta penting yang tidak didukung ide.\n"
+        + production_package.FIDELITY_RULES
+        + production_package.details_block(details or {})
+        + "Tulis keluaran HANYA sebagai JSON valid yang mengikuti struktur contoh ini: "
         + json.dumps(story_schema_example(), ensure_ascii=False)
         + f"\n\nJenis video: {goal}\nDurasi target: {duration}\nGaya visual: {style}\nIde pengguna: {idea}"
     )
+
+# Limits are checked and reported, never cut. A draft that exceeds them is rejected so the user can retry.
+STORY_LIMITS = {"title": 120, "purpose": 1000, "visual": 1500, "action": 1000, "expression": 500, "location": 300,
+                "time": 100, "camera": 500, "lighting": 300, "dialogue": 1000, "duration": 50}
+MAX_STORY_ALTERNATIVES = 3
+MAX_STORY_SCENES = 12
+MAX_STORY_ITEMS = 12
+
+def _story_text(scene, key, default, number):
+    value = str(scene.get(key, default))
+    if len(value) > STORY_LIMITS[key]:
+        raise ValueError(f"Adegan nomor {number}: kolom {key} terlalu panjang ({len(value)} karakter, maks. {STORY_LIMITS[key]}). Coba lagi.")
+    return value
 
 def normalize_story_draft(draft):
     alternatives = draft.get("alternatives") if isinstance(draft, dict) else None
     if not isinstance(alternatives, list) or not alternatives:
         raise ValueError("Model belum menghasilkan alternatif cerita yang valid. Coba lagi atau gunakan kerangka manual.")
+    if len(alternatives) > MAX_STORY_ALTERNATIVES:
+        raise ValueError(f"Model menghasilkan {len(alternatives)} alternatif; maksimal {MAX_STORY_ALTERNATIVES}. Coba lagi.")
     normalized = []
-    for alternative in alternatives[:3]:
+    for number, alternative in enumerate(alternatives, 1):
         if not isinstance(alternative, dict) or not isinstance(alternative.get("scenes"), list) or not alternative["scenes"]:
-            continue
-        alternative["characters"] = alternative.get("characters", [])[:12]
-        alternative["locations"] = alternative.get("locations", [])[:12]
-        alternative["scenes"] = [{
-            "id": str(uuid.uuid4()), "title": str(s.get("title", "Adegan"))[:120],
-            "purpose": str(s.get("purpose", ""))[:1000], "visual": str(s.get("visual", ""))[:1500],
-            "action": str(s.get("action", ""))[:1000], "expression": str(s.get("expression", ""))[:500],
-            "location": str(s.get("location", ""))[:300], "time": str(s.get("time", ""))[:100],
-            "camera": str(s.get("camera", ""))[:500], "lighting": str(s.get("lighting", ""))[:300],
-            "dialogue": str(s.get("dialogue", ""))[:1000], "duration": str(s.get("duration", "5 detik"))[:50],
-            "assetIds": [], "production": "Draft",
-        } for s in alternative["scenes"][:8] if isinstance(s, dict)]
-        if alternative["scenes"]:
-            normalized.append(alternative)
-    if not normalized:
-        raise ValueError("Model belum menghasilkan adegan valid. Coba lagi atau gunakan kerangka manual.")
+            raise ValueError(f"Alternatif nomor {number} tidak memiliki adegan. Coba lagi.")
+        scenes = alternative["scenes"]
+        if len(scenes) > MAX_STORY_SCENES:
+            raise ValueError(f"Alternatif nomor {number} memuat {len(scenes)} adegan; maksimal {MAX_STORY_SCENES}. Coba lagi.")
+        for key in ("characters", "locations"):
+            items = alternative.get(key, [])
+            if not isinstance(items, list) or len(items) > MAX_STORY_ITEMS:
+                raise ValueError(f"Daftar {key} pada alternatif nomor {number} tidak valid atau lebih dari {MAX_STORY_ITEMS}. Coba lagi.")
+        alternative["characters"] = alternative.get("characters", [])
+        alternative["locations"] = alternative.get("locations", [])
+        normalized_scenes = []
+        for index, scene in enumerate(scenes, 1):
+            if not isinstance(scene, dict):
+                raise ValueError(f"Adegan nomor {index} pada alternatif {number} harus berupa objek. Coba lagi.")
+            item = {"id": str(uuid.uuid4()), "assetIds": [], "production": "Draft"}
+            for key, default in {**{key: "" for key in STORY_LIMITS}, "title": "Adegan", "duration": "5 detik"}.items():
+                item[key] = _story_text(scene, key, default, index)
+            normalized_scenes.append(item)
+        alternative["scenes"] = normalized_scenes
+        normalized.append(alternative)
     return {"alternatives": normalized}
 
 class GeminiProviderError(Exception):
@@ -520,13 +549,13 @@ class GeminiProviderError(Exception):
         super().__init__(message)
         self.status = status
 
-def make_gemini_story(idea, goal, duration, style):
+def gemini_generate_text(prompt, max_output_tokens):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise GeminiProviderError(503, "GEMINI_API_KEY belum terbaca oleh server. Isi file .env di folder proyek (sejajar dengan app.py), simpan, lalu jalankan ulang server. Gemini tidak dijalankan.")
     body = json.dumps({
-        "contents": [{"parts": [{"text": story_prompt(idea, goal, duration, style)}]}],
-        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 3500},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.5, "maxOutputTokens": max_output_tokens},
     }).encode("utf-8")
     request = urllib.request.Request(
         GEMINI_API_URL,
@@ -554,20 +583,70 @@ def make_gemini_story(idea, goal, duration, style):
         raise GeminiProviderError(502, "Respons Gemini terlalu besar untuk diproses.")
     try:
         payload = json.loads(raw)
-        parts = payload["candidates"][0]["content"]["parts"]
-        text = "".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str))
-        draft = json.loads(text)
-        return normalize_story_draft(draft)
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        if isinstance(exc, ValueError) and str(exc).startswith("Model belum menghasilkan"):
-            raise GeminiProviderError(502, "Respons Gemini tidak sesuai struktur cerita yang diharapkan.") from None
-        raise GeminiProviderError(502, "Respons Gemini kosong atau bukan JSON cerita yang valid.") from None
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise GeminiProviderError(502, "Respons Gemini kosong atau tidak valid. Coba lagi.") from None
+    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    if not candidates:
+        reason = (payload.get("promptFeedback") or {}).get("blockReason") if isinstance(payload, dict) else None
+        raise GeminiProviderError(502, f"Gemini tidak mengembalikan jawaban{f' (alasan: {str(reason)[:40]})' if reason else ''}. Ubah ide lalu coba lagi.")
+    candidate = candidates[0] if isinstance(candidates[0], dict) else {}
+    reason = str(candidate.get("finishReason") or "STOP")
+    if reason == "MAX_TOKENS":
+        raise GeminiProviderError(502, "Respons Gemini terpotong karena terlalu panjang. Coba lagi dengan ide yang lebih ringkas.")
+    if reason != "STOP":
+        raise GeminiProviderError(502, f"Gemini menghentikan respons (alasan: {reason[:40]}). Ubah ide lalu coba lagi.")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str))
+    if not text.strip():
+        raise GeminiProviderError(502, "Respons Gemini kosong. Coba lagi.")
+    return text
 
-def make_local_story(idea, goal, duration, style, model):
+def request_text(body, key, limit, default=""):
+    """Text from the request. Longer text is refused with a message, never cut."""
+    value = str(body.get(key, default) or "")
+    if len(value) > limit:
+        raise production_package.ProductionPackageError(f"Isian {key} terlalu panjang (maks. {limit} karakter).")
+    return value
+
+def make_gemini_story(idea, goal, duration, style, details=None):
+    text = gemini_generate_text(story_prompt(idea, goal, duration, style, details), 3500)
+    try:
+        draft = json.loads(production_package.strip_json_fence(text))
+    except json.JSONDecodeError:
+        raise GeminiProviderError(502, "Respons Gemini bukan JSON cerita yang valid. Coba lagi.") from None
+    try:
+        return normalize_story_draft(draft)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise GeminiProviderError(502, str(exc) if isinstance(exc, ValueError) else "Respons Gemini tidak sesuai struktur cerita yang diharapkan.") from None
+
+def make_gemini_understanding(idea, goal, duration, style, details):
+    text = gemini_generate_text(production_package.understanding_prompt(idea, goal, duration, style, details), 3000)
+    try:
+        raw = json.loads(production_package.strip_json_fence(text))
+    except json.JSONDecodeError:
+        raise GeminiProviderError(502, "Respons Gemini bukan JSON pemahaman ide yang valid. Coba lagi.") from None
+    try:
+        return production_package.validate_understanding(raw)
+    except production_package.ProductionPackageError as exc:
+        raise GeminiProviderError(502, f"Pemahaman dari Gemini tidak valid: {exc}") from None
+
+def make_gemini_production(idea, goal, duration, style, limits, assets, details=None, understanding=None):
+    prompt = production_package.package_prompt(idea, goal, duration, style, assets, limits, details, understanding)
+    text = gemini_generate_text(prompt, 12000)
+    try:
+        raw = json.loads(production_package.strip_json_fence(text))
+    except json.JSONDecodeError:
+        raise GeminiProviderError(502, "Respons Gemini bukan JSON paket produksi yang valid. Coba lagi.") from None
+    try:
+        return production_package.validate_package(raw, assets, limits, production_package.parse_target_seconds(duration), require_english=True)
+    except production_package.ProductionPackageError as exc:
+        raise GeminiProviderError(502, f"Paket produksi dari Gemini tidak valid: {exc}") from None
+
+def make_local_story(idea, goal, duration, style, model, details=None):
     models = local_ollama_models()
     if model not in models:
         raise ValueError("Pilih model yang terpasang di Ollama lokal.")
-    prompt = story_prompt(idea, goal, duration, style)
+    prompt = story_prompt(idea, goal, duration, style, details)
     body = json.dumps({
         "model": model,
         "stream": False,
@@ -650,20 +729,69 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200, file.read_bytes(), mimetypes.guess_type(file.name)[0] or "application/octet-stream")
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/ai/understanding":
+            try:
+                body = self.payload()
+                if body is None: return
+                idea = str(body.get("idea", "")).strip()
+                if not idea or len(idea) > 7000: return self.send(400, '{"error":"Isi ide (maks. 7.000 karakter) sebelum memeriksa pemahaman."}')
+                understanding = make_gemini_understanding(
+                    idea, request_text(body, "goal", 100), request_text(body, "duration", 50), request_text(body, "style", 100),
+                    production_package.project_details(body))
+                return self.send(200, json.dumps({"understanding": understanding}, ensure_ascii=False))
+            except production_package.ProductionPackageError as exc:
+                return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            except GeminiProviderError as exc:
+                return self.send(exc.status, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            except Exception:
+                return self.send(502, '{"error":"Gemini tidak merespons dengan pemahaman ide yang valid. Coba lagi."}')
+        if path == "/api/ai/production":
+            try:
+                body = self.payload()
+                if body is None: return
+                limits = production_package.model_limits(body.get("model_key"))
+                project_id = str(body.get("project_id", "")).strip()[:64]
+                if not project_id: return self.send(400, '{"error":"Simpan proyek terlebih dahulu sebelum membuat paket produksi."}')
+                with connect() as db: row = db.execute("SELECT idea, data FROM projects WHERE id=?", (project_id,)).fetchone()
+                if not row: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
+                data = json.loads(row["data"])
+                # The package is only made from a summary the user confirmed for the idea that is saved on the server.
+                understanding = production_package.confirmed_understanding(data.get("understanding"), row["idea"])
+                idea = str(row["idea"] or "").strip()
+                if not idea or len(idea) > 7000: return self.send(400, '{"error":"Isi ide (maks. 7.000 karakter) sebelum membuat konsep."}')
+                if str(body.get("idea", "")).strip() != idea:
+                    return self.send(409, '{"error":"Ide di layar berbeda dari ide yang tersimpan. Simpan proyek, lalu konfirmasi ulang pemahaman."}')
+                goal = request_text(body, "goal", 100)
+                duration = request_text(body, "duration", 50)
+                style = request_text(body, "style", 100)
+                assets = [item for item in (data.get("assets") or []) if isinstance(item, dict)]
+                if body.get("include_images"):
+                    if production_package.photo_consent_required(assets) and body.get("consent_photos") is not True:
+                        return self.send(400, json.dumps({"error": "Foto orang hanya boleh dikirim ke Gemini setelah Anda menyetujuinya. Centang persetujuan terlebih dahulu."}, ensure_ascii=False))
+                    return self.send(501, json.dumps({"error": "Pengiriman gambar ke Gemini belum tersedia pada tahap ini. Konsep dibuat dari ide dan daftar gambar yang diunggah saja."}, ensure_ascii=False))
+                package = make_gemini_production(idea, goal, duration, style, limits, assets, production_package.project_details(data), understanding)
+                return self.send(200, json.dumps({"package": package}, ensure_ascii=False))
+            except production_package.ProductionPackageError as exc:
+                return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            except GeminiProviderError as exc:
+                return self.send(exc.status, json.dumps({"error": str(exc)}, ensure_ascii=False))
+            except Exception:
+                return self.send(502, '{"error":"Gemini tidak merespons dengan paket produksi yang valid. Coba lagi."}')
         if path == "/api/ai/story":
             try:
                 body = self.payload()
                 if body is None: return
                 idea = str(body.get("idea", "")).strip()
                 if not idea or len(idea) > 7000: return self.send(400, '{"error":"Isi ide (maks. 7.000 karakter) sebelum meminta draft."}')
-                goal = str(body.get("goal", ""))[:100]
-                duration = str(body.get("duration", "1 menit"))[:50]
-                style = str(body.get("style", ""))[:100]
+                goal = request_text(body, "goal", 100)
+                duration = request_text(body, "duration", 50, "1 menit")
+                style = request_text(body, "style", 100)
+                details = production_package.project_details(body)
                 provider = str(body.get("provider", "ollama")).strip().lower()
                 if provider == "gemini":
-                    draft = make_gemini_story(idea, goal, duration, style)
+                    draft = make_gemini_story(idea, goal, duration, style, details)
                 elif provider == "ollama":
-                    draft = make_local_story(idea, goal, duration, style, str(body.get("model", "")))
+                    draft = make_local_story(idea, goal, duration, style, str(body.get("model", "")), details)
                 else:
                     return self.send(400, '{"error":"Provider AI tidak dikenal. Pilih Ollama atau Gemini."}')
                 return self.send(200, json.dumps({"draft": draft}, ensure_ascii=False))
@@ -720,8 +848,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(500, '{"error":"Gagal menyimpan gambar ke proyek."}')
             return self.send(201, json.dumps({"name": filename, "url": f"/uploads/{saved}", "asset": asset}, ensure_ascii=False))
         return self.send(404, '{"error":"Endpoint tidak ditemukan"}')
+    def save_production_package(self, ident):
+        body = self.payload()
+        if body is None: return
+        try:
+            package = body.get("package")
+            target = production_package.parse_stored_target(body.get("targetSeconds"))
+            with connect() as db:
+                row = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
+                if not row: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
+                data = json.loads(row["data"])
+                data.pop("productionPackage", None)
+                if package is not None:
+                    assets = [item for item in data.get("assets") or [] if isinstance(item, dict)]
+                    saved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    data["productionPackage"] = production_package.prepare_for_storage(package, assets, target, saved_at)
+                db.execute("UPDATE projects SET data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(data, ensure_ascii=False), ident))
+                saved = db.execute("SELECT * FROM projects WHERE id=?", (ident,)).fetchone()
+        except production_package.ProductionPackageError as exc:
+            return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
+        except sqlite3.Error:
+            return self.send(500, '{"error":"Gagal menyimpan paket produksi. Data proyek tidak berubah."}')
+        return self.send(200, json.dumps(project(saved), ensure_ascii=False))
     def do_PUT(self):
-        ident = urlparse(self.path).path.split("/")[-1]
+        path = urlparse(self.path).path
+        if path.startswith("/api/projects/") and path.endswith("/production-package"):
+            return self.save_production_package(path.split("/")[-2])
+        ident = path.split("/")[-1]
         body = self.payload()
         if body is None: return
         try:
@@ -729,8 +882,12 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
         with connect() as db:
-            exists = db.execute("SELECT 1 FROM projects WHERE id=?", (ident,)).fetchone()
+            exists = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
             if not exists: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
+            # Keep the stored package: autosave sends a whole snapshot that may be older than the saved package.
+            data.pop("productionPackage", None)
+            stored = json.loads(exists["data"]).get("productionPackage")
+            if stored is not None: data["productionPackage"] = stored
             db.execute("UPDATE projects SET title=?,goal=?,idea=?,platform=?,status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (body.get("title", "Proyek"), body.get("goal", ""), body.get("idea", ""), body.get("platform", "flow"), body.get("status", "Draft"), json.dumps(data, ensure_ascii=False), ident))
             row = db.execute("SELECT * FROM projects WHERE id=?", (ident,)).fetchone()
         return self.send(200, json.dumps(project(row), ensure_ascii=False))

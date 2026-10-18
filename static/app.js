@@ -119,7 +119,7 @@ function assemblePromptText(clip,pkg,lang){
   const en=lang==='en', L=packageLabels[lang], base=(en?clip.prompt_en:clip.prompt_final)||'';
   if(!base)return {text:'',missing:[]};
   const lines=[], missing=[], english=clip.en||{};
-  const add=(label,value)=>{if(!value)return;if(base.toLowerCase().includes(String(value).toLowerCase()))return;lines.push(`- ${label}: ${value}`)};
+  const add=(label,value)=>{if(!value)return;lines.push(`- ${label}: ${value}`)};
   const field=(key,label,idValue)=>{if(!en)return add(label,idValue);if(english[key])return add(label,english[key]);if(idValue)missing.push(label)};
   field('action',L.action,clip.action);
   field('camera',L.camera,clip.camera);

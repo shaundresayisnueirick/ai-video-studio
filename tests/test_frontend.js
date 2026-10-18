@@ -795,6 +795,28 @@ test('copy button copies the clip prompt in the chosen language with its structu
   assert.match(element('#toast').textContent, /Tersalin/);
 });
 
+test('copied prompts keep every labelled detail line even when the base prompt already contains the same words', async () => {
+  const copied = [];
+  const { context, click } = appContext({ clipboardImpl: async text => { copied.push(text); } });
+  const pkg = samplePackage();
+  const clip = pkg.clips[1];
+  clip.prompt_final = 'Rani duduk, kamera medium shot, cahaya hangat.';
+  clip.prompt_en = 'Rani sits, medium shot, warm light.';
+  clip.camera = 'medium shot';
+  clip.lighting = 'cahaya hangat';
+  clip.en = { ...clip.en, camera: 'medium shot', lighting: 'warm light' };
+  openPackageTab(context, packageProject(savedView(pkg)));
+  await tick();
+  await click({ copyClip: '2', copyLang: 'id' });
+  await tick();
+  assert.ok(copied[0].includes('- Kamera: medium shot'), 'the camera line is not dropped');
+  assert.ok(copied[0].includes('- Pencahayaan: cahaya hangat'), 'the lighting line is not dropped');
+  await click({ copyClip: '2', copyLang: 'en' });
+  await tick();
+  assert.ok(copied[1].includes('- Camera: medium shot'), 'the English camera line is not dropped');
+  assert.ok(copied[1].includes('- Lighting: warm light'), 'the English lighting line is not dropped');
+});
+
 test('an invalid stored package shows a clear warning and offers only removal', async () => {
   const stored = { schemaVersion: 1, savedAt: null, targetSeconds: null, package: null, error: 'Paket tersimpan tidak lolos validasi: Klip 1 berdurasi 15 detik, melebihi batas 10 detik. Data tersimpan tidak diubah.' };
   const { context, element } = appContext();

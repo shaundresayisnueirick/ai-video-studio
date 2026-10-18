@@ -2007,8 +2007,8 @@ test('a Gemini production clip is mapped manually and contributes to one final s
   assert.match(html, /data-gemini-clip="s1"/);
   assert.match(html, /value="2" selected/);
   const prompt = vm.runInContext("sceneVideoPromptDefault(current.data.scenes[0], current.data)", context);
-  assert.match(prompt, /Arahan inti dari paket produksi Gemini \\(klip 2\\): Tangan menuang kopi, uap naik\\./);
-  assert.match(prompt, /Jika arahan inti ini berbeda dengan detail storyboard di bawah, ikuti detail storyboard sebagai keputusan final\\./);
+  assert.ok(prompt.includes('Arahan inti dari paket produksi Gemini (klip 2): Tangan menuang kopi, uap naik.'));
+  assert.ok(prompt.includes('Jika arahan inti ini berbeda dengan detail storyboard di bawah, ikuti detail storyboard sebagai keputusan final.'));
   assert.match(prompt, /Aksi utama: Rani membuka pintu/);
   assert.match(prompt, /Durasi klip: 5 detik/);
   assert.equal(prompt.includes('Arahan inti dari paket produksi Gemini (klip 1)'), false);

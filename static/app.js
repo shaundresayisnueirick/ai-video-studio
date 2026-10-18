@@ -112,7 +112,7 @@ function sceneVideoPromptDefault(s,d){
   const chars=sceneCharacters(s,d).map(c=>c.name||'tanpa nama'), loc=sceneLocation(s,d), prods=sceneProducts(s,d).map(p=>p.name||'tanpa nama');
   const geminiClip=(d.productionPackage?.package?.clips||[]).find(clip=>Number(clip.index)===Number(s.productionClipIndex));
   return ['Buat satu klip video dari adegan berikut. Gerakan terjadi selama klip berlangsung. Gunakan gambar referensi yang dipilih sebagai panduan visual.',
-    geminiClip?.prompt_final?`Arahan inti dari paket produksi Gemini (klip ${geminiClip.index}): ${geminiClip.prompt_final}\\nJika arahan inti ini berbeda dengan detail storyboard di bawah, ikuti detail storyboard sebagai keputusan final.`:'',
+    geminiClip?.prompt_final?`Arahan inti dari paket produksi Gemini (klip ${geminiClip.index}): ${geminiClip.prompt_final}\nJika arahan inti ini berbeda dengan detail storyboard di bawah, ikuti detail storyboard sebagai keputusan final.`:'',
     `Aksi utama: ${s.action||s.title||'aksi karakter utama'}`,
     chars.length?`Tokoh yang tampil: ${chars.join(', ')}. Pertahankan wajah dan pakaian sesuai referensi.`:'',
     s.visual?`Keadaan awal: ${s.visual}`:'',

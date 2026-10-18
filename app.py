@@ -1,7 +1,7 @@
 """AI Video Studio — local-first, single-user prototype."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 import copy
 import json
@@ -52,6 +52,18 @@ MAX_JSON_BODY_BYTES = 1_000_000
 PRODUCTION_SCHEMA_VERSION = 1
 MAX_IMAGE_PIXELS = 80_000_000
 MAX_DECODED_IMAGE_BYTES = 128_000_000
+MAX_VIDEO_BYTES = 50_000_000
+VIDEO_CHUNK_BYTES = 65_536
+MAX_RESULT_NOTE = 500
+VIDEO_RESULT_STATUSES = ("kandidat", "utama", "revisi")
+VIDEO_TYPES = {
+    "video/mp4": (".mp4", lambda head: head[4:8] == b"ftyp"),
+    "video/webm": (".webm", lambda head: head[:4] == b"\x1aE\xdf\xa3"),
+}
+
+class _NotFound(Exception): pass
+class _BadScene(Exception): pass
+class _MissingFile(Exception): pass
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 DATA.mkdir(exist_ok=True)
@@ -87,6 +99,15 @@ def project(row):
 def _as_list(value):
     return value if isinstance(value, list) else []
 
+INVALID_PROJECT_ID = '{"error":"ID proyek tidak valid."}'
+
+def valid_project_id(value):
+    # Project ids are canonical UUIDs; anything else must never reach a file name or glob pattern.
+    try:
+        return str(uuid.UUID(value)) == value
+    except (TypeError, ValueError):
+        return False
+
 def normalize_production_data(value, project_fields=None):
     """Add the versioned production contract while retaining legacy fields."""
     if not isinstance(value, dict):
@@ -104,6 +125,7 @@ def normalize_production_data(value, project_fields=None):
     data.setdefault("checks", {})
     data["scenes"] = _as_list(data["scenes"])
     data["assets"] = _as_list(data["assets"])
+    data["videoResults"] = _as_list(data.get("videoResults"))
     data["checks"] = data["checks"] if isinstance(data["checks"], dict) else {}
 
     fields = project_fields or {}
@@ -727,6 +749,17 @@ class Handler(BaseHTTPRequestHandler):
         if ROOT.joinpath("static").resolve() not in file.parents and file != ROOT.joinpath("static").resolve(): return self.send(403, "Forbidden", "text/plain")
         if not file.is_file(): return self.send(404, "Tidak ditemukan", "text/plain; charset=utf-8")
         return self.send(200, file.read_bytes(), mimetypes.guess_type(file.name)[0] or "application/octet-stream")
+    def do_HEAD(self):
+        # Lets the browser tell a missing upload (404) from one that exists, without downloading it.
+        path = urlparse(self.path).path
+        if not path.startswith("/uploads/"): return self.send(404, b"")
+        file = UPLOADS / Path(path.removeprefix("/uploads/")).name
+        if not file.is_file(): return self.send(404, b"")
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(file.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(file.stat().st_size))
+        self.end_headers()
+
     def do_POST(self):
         path = urlparse(self.path).path
         if path == "/api/ai/understanding":
@@ -810,8 +843,11 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO projects(id,title,goal,idea,platform,status,data) VALUES(?,?,?,?,?,?,?)", (ident, body.get("title", "Proyek baru"), body.get("goal", "Konten media sosial"), body.get("idea", ""), body.get("platform", "flow"), "Draft", json.dumps(data, ensure_ascii=False)))
                 row = db.execute("SELECT * FROM projects WHERE id=?", (ident,)).fetchone()
             return self.send(201, json.dumps(project(row), ensure_ascii=False))
+        if path.startswith("/api/projects/") and path.endswith("/video-results"):
+            return self.save_video_result(path.split("/")[-2])
         if path.startswith("/api/projects/") and path.endswith("/assets"):
             ident = path.split("/")[-2]
+            if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
             filename = Path(self.headers.get("X-Filename", "referensi")).name
             content_type = self.headers.get("Content-Type", "application/octet-stream")
             try:
@@ -834,6 +870,7 @@ class Handler(BaseHTTPRequestHandler):
                     file_created = True
                     output.write(raw)
                 with connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
                     row = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
                     if not row:
                         if file_created: saved_path.unlink(missing_ok=True)
@@ -848,13 +885,112 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(500, '{"error":"Gagal menyimpan gambar ke proyek."}')
             return self.send(201, json.dumps({"name": filename, "url": f"/uploads/{saved}", "asset": asset}, ensure_ascii=False))
         return self.send(404, '{"error":"Endpoint tidak ditemukan"}')
+    def save_video_result(self, ident):
+        if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
+        filename =Path(self.headers.get("X-Filename", "hasil-video")).name[:200] or "hasil-video"
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        scene_id = self.headers.get("X-Scene-Id", "")
+        note = unquote(self.headers.get("X-Result-Note", ""))
+        if len(note) > MAX_RESULT_NOTE: return self.send(400, json.dumps({"error": "Catatan hasil maksimum 500 karakter."}, ensure_ascii=False))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            return self.send(400, '{"error":"Ukuran unggahan tidak valid."}')
+        if length <= 0: return self.send(400, '{"error":"File video kosong."}')
+        if content_type not in VIDEO_TYPES: return self.send(415, json.dumps({"error": "Format video harus MP4 atau WebM."}, ensure_ascii=False))
+        if length > MAX_VIDEO_BYTES: return self.send(413, json.dumps({"error": "Ukuran video maksimum 50 MB."}, ensure_ascii=False))
+        suffix, matches_format = VIDEO_TYPES[content_type]
+        partial = UPLOADS / f".{ident}.partial-{uuid.uuid4().hex}"
+        saved_path = UPLOADS / f"{ident}-{uuid.uuid4().hex}{suffix}"
+        head, remaining = b"", length
+        try:
+            # Stream the body to disk in pieces so a large video never sits fully in memory.
+            with partial.open("xb") as output:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(VIDEO_CHUNK_BYTES, remaining))
+                    if not chunk: break
+                    if len(head) < 12: head += chunk[:12 - len(head)]
+                    output.write(chunk)
+                    remaining -= len(chunk)
+        except OSError:
+            partial.unlink(missing_ok=True)
+            return self.send(500, '{"error":"Gagal menyimpan video. Tidak ada hasil yang tersimpan."}')
+        if remaining:
+            partial.unlink(missing_ok=True)
+            return self.send(400, '{"error":"Unggahan video terpotong. Tidak ada hasil yang tersimpan."}')
+        if not matches_format(head):
+            partial.unlink(missing_ok=True)
+            return self.send(415, json.dumps({"error": "Isi file tidak sesuai dengan format video yang dipilih."}, ensure_ascii=False))
+        record, results = None, None
+        try:
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
+                if not row: raise _NotFound()
+                data = json.loads(row["data"])
+                if not any(isinstance(scene, dict) and scene.get("id") == scene_id for scene in _as_list(data.get("scenes"))): raise _BadScene()
+                partial.replace(saved_path)
+                record = {"id": str(uuid.uuid4()), "sceneId": scene_id, "name": filename, "url": f"/uploads/{saved_path.name}", "type": content_type,
+                          "size": length, "addedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "note": note, "status": "kandidat"}
+                results = _as_list(data.get("videoResults")) + [record]
+                data["videoResults"] = results
+                db.execute("UPDATE projects SET data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(data, ensure_ascii=False), ident))
+        except (_NotFound, _BadScene, Exception) as exc:
+            partial.unlink(missing_ok=True)
+            saved_path.unlink(missing_ok=True)
+            if isinstance(exc, _NotFound): return self.send(404, '{"error":"Proyek tidak ditemukan"}')
+            if isinstance(exc, _BadScene): return self.send(400, '{"error":"Adegan tidak ditemukan di proyek ini."}')
+            return self.send(500, '{"error":"Gagal menyimpan hasil video. Tidak ada hasil yang tersimpan."}')
+        return self.send(201, json.dumps({"result": record, "videoResults": results}, ensure_ascii=False))
+
+    def update_video_result(self, ident, result_id):
+        if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
+        body = self.payload()
+        if body is None: return
+        status, note = body.get("status"), body.get("note")
+        if status is not None and status not in VIDEO_RESULT_STATUSES:
+            return self.send(400, json.dumps({"error": "Status hasil harus kandidat, utama, atau revisi."}, ensure_ascii=False))
+        if note is not None and (not isinstance(note, str) or len(note) > MAX_RESULT_NOTE):
+            return self.send(400, json.dumps({"error": "Catatan hasil maksimum 500 karakter."}, ensure_ascii=False))
+        try:
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
+                if not row: raise _NotFound()
+                data = json.loads(row["data"])
+                results = _as_list(data.get("videoResults"))
+                target = next((item for item in results if isinstance(item, dict) and item.get("id") == result_id), None)
+                if target is None: raise _NotFound()
+                if status is not None:
+                    if status == "utama":
+                        # A result whose file is gone cannot be the main result: the saved state must match the files.
+                        if not (UPLOADS / Path(str(target.get("url", ""))).name).is_file(): raise _MissingFile()
+                        # One main result per scene: the previous main result becomes a candidate.
+                        for item in results:
+                            if isinstance(item, dict) and item is not target and item.get("sceneId") == target.get("sceneId") and item.get("status") == "utama":
+                                item["status"] = "kandidat"
+                    target["status"] = status
+                if note is not None: target["note"] = note
+                data["videoResults"] = results
+                db.execute("UPDATE projects SET data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(data, ensure_ascii=False), ident))
+        except _NotFound:
+            return self.send(404, '{"error":"Hasil video tidak ditemukan"}')
+        except _MissingFile:
+            return self.send(400, '{"error":"File hasil tidak ditemukan, sehingga tidak bisa dijadikan hasil utama. Unggah ulang video."}')
+        except sqlite3.Error:
+            return self.send(500, '{"error":"Gagal menyimpan perubahan hasil. Data tidak berubah."}')
+        return self.send(200, json.dumps({"result": target, "videoResults": results}, ensure_ascii=False))
+
     def save_production_package(self, ident):
+        if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
         body = self.payload()
         if body is None: return
         try:
             package = body.get("package")
             target = production_package.parse_stored_target(body.get("targetSeconds"))
             with connect() as db:
+                # Read inside the write transaction so a video result committed meanwhile is not overwritten.
+                db.execute("BEGIN IMMEDIATE")
                 row = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
                 if not row: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
                 data = json.loads(row["data"])
@@ -872,9 +1008,13 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(200, json.dumps(project(saved), ensure_ascii=False))
     def do_PUT(self):
         path = urlparse(self.path).path
+        parts = path.split("/")
+        if path.startswith("/api/projects/") and len(parts) == 6 and parts[4] == "video-results":
+            return self.update_video_result(parts[3], parts[5])
         if path.startswith("/api/projects/") and path.endswith("/production-package"):
             return self.save_production_package(path.split("/")[-2])
         ident = path.split("/")[-1]
+        if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
         body = self.payload()
         if body is None: return
         try:
@@ -882,11 +1022,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))
         with connect() as db:
+            # The stored data is read inside the write transaction: an upload committed after a plain read would be overwritten.
+            db.execute("BEGIN IMMEDIATE")
             exists = db.execute("SELECT data FROM projects WHERE id=?", (ident,)).fetchone()
             if not exists: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
             # Keep the stored package: autosave sends a whole snapshot that may be older than the saved package.
             data.pop("productionPackage", None)
-            stored = json.loads(exists["data"]).get("productionPackage")
+            stored_data = json.loads(exists["data"])
+            stored = stored_data.get("productionPackage")
+            # Video results are owned by the server: autosave cannot add, remove, or overwrite them.
+            data["videoResults"] = _as_list(stored_data.get("videoResults"))
             if stored is not None: data["productionPackage"] = stored
             db.execute("UPDATE projects SET title=?,goal=?,idea=?,platform=?,status=?,data=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (body.get("title", "Proyek"), body.get("goal", ""), body.get("idea", ""), body.get("platform", "flow"), body.get("status", "Draft"), json.dumps(data, ensure_ascii=False), ident))
             row = db.execute("SELECT * FROM projects WHERE id=?", (ident,)).fetchone()
@@ -896,6 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         if len(parts) == 5 and parts[0] == "api" and parts[1] == "projects" and parts[3] == "assets":
             ident, asset_id = parts[2], parts[4]
+            if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
             quarantine = None
             original_path = None
             old_data = None
@@ -1181,10 +1327,17 @@ class Handler(BaseHTTPRequestHandler):
                 # restore metadata for an asset whose file is gone.
                 return self.send(200, response_body)
 
-        ident = path.split("/")[-1]
+        segments = path.split("/")
+        if len(segments) != 4 or segments[1:3] != ["api", "projects"]:
+            return self.send(404, '{"error":"Endpoint tidak ditemukan"}')
+        ident = segments[3]
+        if not valid_project_id(ident): return self.send(400, INVALID_PROJECT_ID)
         with connect() as db:
-            db.execute("DELETE FROM projects WHERE id=?", (ident,))
+            deleted = db.execute("DELETE FROM projects WHERE id=?", (ident,)).rowcount
+        if deleted != 1: return self.send(404, '{"error":"Proyek tidak ditemukan"}')
+        # Files go only after the project row is gone. The id is a validated UUID, so these patterns match this project alone.
         for file in UPLOADS.glob(f"{ident}-*"): file.unlink(missing_ok=True)
+        for file in UPLOADS.glob(f".{ident}.partial-*"): file.unlink(missing_ok=True)
         return self.send(204, "")
 
 if __name__ == "__main__":

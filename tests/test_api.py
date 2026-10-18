@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import app
 
+MISSING_PROJECT = "00000000-0000-4000-8000-000000000000"
+
 
 class Request(app.Handler):
     def __init__(self, method, path, body=b"", headers=None):
@@ -217,24 +219,24 @@ class ApiSmokeTests(unittest.TestCase):
             "image/webp": base64.b64decode("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAUAmJaACdLoB+AADsAD+82mX/mwK5rn3+//pcH6XB+lwf+lIAAA="),
         }
     def test_non_image_upload_is_rejected(self):
-        req = Request("POST", "/api/projects/unknown/assets", b"x", {"Content-Type":"video/mp4"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", b"x", {"Content-Type":"video/mp4"})
         req.do_POST()
         self.assertEqual(req.status, 415)
     def test_invalid_image_bytes_and_mime_mismatch_are_rejected(self):
-        req = Request("POST", "/api/projects/unknown/assets", b"not a png", {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", b"not a png", {"Content-Type":"image/png"})
         req.do_POST()
         self.assertEqual(req.status, 415)
-        req = Request("POST", "/api/projects/unknown/assets", self.png(), {"Content-Type":"image/jpeg"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", self.png(), {"Content-Type":"image/jpeg"})
         req.do_POST()
         self.assertEqual(req.status, 415)
     def test_upload_limit_is_checked_before_body_read_and_boundary_is_inclusive(self):
         image = self.png()
-        req = Request("POST", "/api/projects/unknown/assets", image, {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", image, {"Content-Type":"image/png"})
         with patch.object(app, "MAX_ASSET_BYTES", len(image)):
             req.do_POST()
         self.assertTrue(req.read_called)
         self.assertEqual(req.status, 404)
-        req = Request("POST", "/api/projects/unknown/assets", image, {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", image, {"Content-Type":"image/png"})
         req.headers["Content-Length"] = str(len(image) + 1)
         with patch.object(app, "MAX_ASSET_BYTES", len(image)):
             req.do_POST()
@@ -260,7 +262,7 @@ class ApiSmokeTests(unittest.TestCase):
         ]
         for body, content_type, expected in cases:
             with self.subTest(content_type=content_type, expected=expected):
-                req = Request("POST", "/api/projects/unknown/assets", body, {"Content-Type":content_type})
+                req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", body, {"Content-Type":content_type})
                 req.do_POST()
                 self.assertEqual(req.status, expected)
     def test_actual_12mb_boundary_and_oversize_content_length(self):
@@ -281,7 +283,7 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(saved.stat().st_size, limit)
 
         oversized = b"x" * (limit + 1)
-        req = Request("POST", "/api/projects/unknown/assets", oversized, {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", oversized, {"Content-Type":"image/png"})
         req.do_POST()
         self.assertFalse(req.read_called)
         self.assertEqual(req.status, 413)
@@ -298,11 +300,11 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual([path.name for path in app.UPLOADS.iterdir()], [other.name])
         self.assertEqual(other.read_bytes(), b"leave this file alone")
     def test_truncated_body_and_invalid_content_length_are_rejected(self):
-        req = Request("POST", "/api/projects/unknown/assets", b"abc", {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", b"abc", {"Content-Type":"image/png"})
         req.headers["Content-Length"] = "4"
         req.do_POST()
         self.assertEqual(req.status, 400)
-        req = Request("POST", "/api/projects/unknown/assets", b"", {"Content-Type":"image/png"})
+        req = Request("POST", f"/api/projects/{MISSING_PROJECT}/assets", b"", {"Content-Type":"image/png"})
         req.headers["Content-Length"] = "oops"
         req.do_POST()
         self.assertEqual(req.status, 400)

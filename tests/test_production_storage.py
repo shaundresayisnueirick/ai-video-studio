@@ -11,6 +11,8 @@ import app
 import production_package as pp
 from test_production import LIMITS, PACKAGES, PHOTO, PLACE, PRODUCT, Request
 
+MISSING_PROJECT = "00000000-0000-4000-8000-000000000000"
+
 
 def valid_package(name, assets, links=None, target=None):
     """A normalized package, the same shape the client receives from /api/ai/production and sends back to save."""
@@ -163,7 +165,7 @@ class StorageValidationTests(StorageBase):
         self.assertIsNone(self.raw_envelope(project["id"]))
 
     def test_saving_to_missing_project_returns_404(self):
-        req = self.save("tidak-ada", valid_package("edukasi", []))
+        req = self.save(MISSING_PROJECT, valid_package("edukasi", []))
         self.assertEqual(req.status, 404)
 
     def test_package_without_clips_is_rejected(self):

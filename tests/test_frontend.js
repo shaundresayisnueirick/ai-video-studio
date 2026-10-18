@@ -54,9 +54,9 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
     fetch, console,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../static/app.js'), 'utf8'), context);
-  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt } = {}) {
+  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt, resultStatus, resultId, flowStart } = {}) {
     const target = {
-      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt },
+      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style, copyChar, copyScene, copyEntity, resetPrompt, resultStatus, resultId, flowStart },
       closest(selector) {
         if (selector === '[data-tab]' && tab) return { dataset: { tab } };
         if (selector === '[data-view]' && view) return { dataset: { view } };
@@ -1952,7 +1952,7 @@ test('the scene summary lists the linked character, location, product, and shot 
   assert.match(summary, /<dt>Prompt video<\/dt><dd>belum disalin<\/dd>/);
 });
 
-test('the next step asks for missing references first, then the storyboard image, then the Flow run', async () => {
+test('the next step asks for missing references first, then the Flow prompt, and a storyboard image is optional', async () => {
   const p = twoSceneProject();
   p.data.assets = [];
   const { context, element, click } = appContext({ fetchImpl: planFetch(), clipboardImpl: async () => {} });
@@ -1964,11 +1964,13 @@ test('the next step asks for missing references first, then the storyboard image
     { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
     { id: 'p-kopi', name: 'kopi.png', url: '/uploads/kopi.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' },
   ];
+  vm.runInContext("assetFileState.set('/uploads/wajah.png','ok');assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/kopi.png','ok')", context);
   openStoryboard(context, p);
   await tick();
-  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Buat gambar storyboard di Gemini/);
+  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Periksa prompt video, salin, lalu buka Google Flow\./, 'without a storyboard image the next step is the Flow prompt');
   await click({ copyEntity: 'video:s1' });
   assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Prompt video<\/dt><dd>sudah disalin/);
+  assert.match(sceneHtml(element('#tab-content').innerHTML, 0), /Buka paket Google Flow, periksa kesiapan, lalu tandai sedang dikerjakan/);
 });
 
 test('the video prompt describes motion and camera, is kept separate from the image prompt, and can be edited and copied', async () => {
@@ -2169,4 +2171,323 @@ test('when a scene has one usable and one unusable storyboard image, the thumbna
   assert.equal(/lama\.png/.test(first.slice(0, first.indexOf('Langkah berikutnya'))), false, 'the unusable image is not the thumbnail');
   assert.match(first, /<dt>Status gambar<\/dt><dd>Referensi visual tersedia<\/dd>/, 'the summary reports the usable image');
   assert.match(first, /Gambar adegan<\/b> · lama\.png — file tidak ditemukan/, 'the unusable image is still listed as missing');
+});
+
+// Round 4: production status, readiness, video results, and project summary.
+const ready = (d, ids) => vm.runInContext(`${ids.map(id => `assetFileState.set('${id}','ok')`).join(';')}`, d);
+const videoFetch = ({ posts = [], puts = [], postReply, putReply, deny = null } = {}) => async (url, options) => {
+  if (options?.method === 'POST' && url.endsWith('/video-results')) { posts.push({ url, headers: options.headers, bytes: options.body }); return postReply ? postReply() : response({}); }
+  if (options?.method === 'PUT' && url.includes('/video-results/')) { puts.push({ url, body: JSON.parse(options.body) }); return putReply ? putReply() : response({}); }
+  if (options?.method === 'PUT') return response(JSON.parse(options.body));
+  return planFetch()(url, options);
+};
+const sceneBlock = (context, element, index) => sceneHtml(element('#tab-content').innerHTML, index);
+const linkedScene = () => {
+  const p = twoSceneProject();
+  p.data.assets = [
+    { id: 'a-rani', name: 'wajah.png', url: '/uploads/wajah.png', type: 'Karakter', entityKind: 'characters', entityId: 'char-rani', label: 'wajah' },
+    { id: 'l-ruang', name: 'ruang.png', url: '/uploads/ruang.png', type: 'Lokasi', entityKind: 'locations', entityId: 'loc-ruang', label: 'utama' },
+    { id: 'p-kopi', name: 'kopi.png', url: '/uploads/kopi.png', type: 'Produk', entityKind: 'products', entityId: 'prod-kopi', label: 'utama' },
+  ];
+  return p;
+};
+const resultFor = (id, scene, status = 'kandidat', extra = {}) => ({ id, sceneId: scene, name: `${id}.mp4`, url: `/uploads/${id}.mp4`, type: 'video/mp4', size: 1000000, addedAt: '2026-01-0' + (id.length) + 'T10:00:00+00:00', note: '', status, ...extra });
+
+test('a scene shows Belum siap until its required references exist, then Siap diproduksi, then Sedang dikerjakan when marked', async () => {
+  const p = twoSceneProject();
+  const { context, element, click } = appContext({ fetchImpl: videoFetch(), clipboardImpl: async () => {} });
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneBlock(context, element, 0), /<dt>Status produksi<\/dt><dd>Belum siap<\/dd>/);
+  p.data.assets = linkedScene().data.assets;
+  ready(context, ['/uploads/wajah.png', '/uploads/ruang.png', '/uploads/kopi.png']);
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneBlock(context, element, 0), /<dt>Status produksi<\/dt><dd>Siap diproduksi<\/dd>/);
+  await click({ copyEntity: 'video:s1' });
+  assert.match(sceneBlock(context, element, 0), /<dt>Status produksi<\/dt><dd>Siap diproduksi<\/dd>/, 'copying the prompt does not mean a video exists');
+  await click({ flowStart: 's1' });
+  assert.match(sceneBlock(context, element, 0), /<dt>Status produksi<\/dt><dd>Sedang dikerjakan<\/dd>/);
+  assert.match(sceneBlock(context, element, 0), /Batalkan tanda sedang dikerjakan/);
+  await click({ flowStart: 's1' });
+  assert.match(sceneBlock(context, element, 0), /<dt>Status produksi<\/dt><dd>Siap diproduksi<\/dd>/, 'the manual mark can be removed');
+});
+
+test('the readiness check names what is missing and what the user must do, and a storyboard image is optional', async () => {
+  const p = twoSceneProject();
+  p.data.scenes[0].action = '';
+  p.data.scenes[0].purpose = '';
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneBlock(context, element, 0);
+  assert.match(first, /Kesiapan: Belum lengkap/);
+  assert.match(first, /<b>Informasi adegan<\/b> · Belum lengkap: isi aksi atau tujuan adegan/);
+  assert.match(first, /<b>Karakter Rani<\/b> · Perlu tindakan pengguna: belum ada referensi/);
+  assert.match(first, /<b>Gambar storyboard<\/b> · Siap: tidak dipakai \(opsional\)/);
+});
+
+test('a missing reference file is reported as File tidak ditemukan in the readiness check, not as ready', async () => {
+  const p = linkedScene();
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/wajah.png','missing');assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/kopi.png','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const first = sceneBlock(context, element, 0);
+  assert.match(first, /Kesiapan: File tidak ditemukan/);
+  assert.match(first, /<b>Karakter Rani<\/b> · File tidak ditemukan/);
+  assert.match(first, /<dt>Status produksi<\/dt><dd>Belum siap<\/dd>/);
+});
+
+test('uploading a video saves it as a new result for that scene and shows its name and status', async () => {
+  const posts = [];
+  const result = resultFor('r1', 's1', 'kandidat', { addedAt: '2026-01-01T10:00:00+00:00' });
+  const { context, element, change } = appContext({ fetchImpl: videoFetch({ posts, postReply: () => response({ result, videoResults: [result] }) }) });
+  openStoryboard(context, linkedScene());
+  await tick();
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'r1.mp4', type: 'video/mp4', size: 1000000 }] });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].headers['X-Scene-Id'], 's1');
+  assert.equal(posts[0].headers['Content-Type'], 'video/mp4');
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /Hasil 1: r1\.mp4/);
+  assert.match(html, /<span class="result-status result-kandidat">Kandidat<\/span>/);
+  assert.match(html, /<video class="result-video" controls preload="metadata" src="\/uploads\/r1\.mp4" data-result-video="r1"><\/video>/);
+  assert.match(html, /<dt>Hasil video<\/dt><dd>1 hasil \(belum ada hasil utama\)<\/dd>/);
+});
+
+test('a video in the wrong format or over the size limit is refused before any upload, and a failed upload is not shown as saved', async () => {
+  const posts = [];
+  const { context, element, change } = appContext({ fetchImpl: videoFetch({ posts, postReply: () => ({ ok: false, status: 415, json: async () => ({ error: 'Format video harus MP4 atau WebM.' }) }) }) });
+  openStoryboard(context, linkedScene());
+  await tick();
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'gambar.png', type: 'image/png', size: 1000 }] });
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'besar.mp4', type: 'video/mp4', size: 50_000_001 }] });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(posts.length, 0, 'refused client-side');
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'rusak.mp4', type: 'video/mp4', size: 1000 }] });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(posts.length, 1);
+  assert.equal(/Hasil 1: rusak\.mp4/.test(sceneBlock(context, element, 0)), false, 'a failed upload is not listed as a result');
+  assert.match(sceneBlock(context, element, 0), /Belum ada hasil video untuk adegan ini\./);
+});
+
+test('several results for one scene are kept; choosing a main result demotes the previous one only for that scene', async () => {
+  const puts = [];
+  const r1 = resultFor('r1', 's1', 'utama', { addedAt: '2026-01-01T10:00:00+00:00' });
+  const r2 = resultFor('r2', 's1', 'kandidat', { addedAt: '2026-01-02T10:00:00+00:00' });
+  const other = resultFor('r3', 's2', 'utama', { addedAt: '2026-01-03T10:00:00+00:00' });
+  const demoted = [{ ...r1, status: 'kandidat' }, { ...r2, status: 'utama' }, other];
+  const { context, element, click } = appContext({ fetchImpl: videoFetch({ puts, putReply: () => response({ result: { ...r2, status: 'utama' }, videoResults: demoted }) }) });
+  const p = linkedScene();
+  p.data.videoResults = [r1, r2, other];
+  openStoryboard(context, p);
+  await tick();
+  const before = sceneBlock(context, element, 0);
+  assert.match(before, /Hasil 1: r1\.mp4/);
+  assert.match(before, /Hasil 2: r2\.mp4/);
+  assert.equal(/r3\.mp4/.test(before), false, 'a result of another scene is not shown here');
+  await click({ resultStatus: 'utama', resultId: 'r2' });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(puts.length, 1);
+  assert.deepEqual(puts[0].body, { status: 'utama' });
+  const after = sceneBlock(context, element, 0);
+  assert.match(after, /<span class="result-status result-utama">Hasil utama<\/span>/);
+  assert.match(after, /<span class="result-status result-kandidat">Kandidat<\/span>/);
+  assert.match(after, /<dt>Hasil utama<\/dt><dd>r2\.mp4<\/dd>/);
+  assert.match(after, /<dt>Status produksi<\/dt><dd>Hasil video tersedia<\/dd>/);
+});
+
+test('a failed status change keeps the previous state and reports the problem', async () => {
+  const r1 = resultFor('r1', 's1', 'kandidat');
+  const { context, element, click } = appContext({ fetchImpl: videoFetch({ putReply: () => ({ ok: false, status: 404, json: async () => ({ error: 'Hasil video tidak ditemukan' }) }) }) });
+  const p = linkedScene();
+  p.data.videoResults = [r1];
+  openStoryboard(context, p);
+  await tick();
+  await click({ resultStatus: 'utama', resultId: 'r1' });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.match(sceneBlock(context, element, 0), /<span class="result-status result-kandidat">Kandidat<\/span>/);
+});
+
+test('a revision note is saved with its result, and a revised result is shown as Perlu revisi', async () => {
+  const puts = [];
+  const r1 = resultFor('r1', 's1', 'kandidat');
+  const { context, element, change, click } = appContext({ fetchImpl: videoFetch({ puts, putReply: () => response({ result: {}, videoResults: [{ ...r1, note: 'wajah terlalu gelap', status: 'revisi' }] }) }) });
+  const p = linkedScene();
+  p.data.videoResults = [r1];
+  openStoryboard(context, p);
+  await tick();
+  change({ dataset: { resultNoteInput: 'r1' }, value: 'wajah terlalu gelap' });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.deepEqual(puts[0].body, { note: 'wajah terlalu gelap' });
+  await click({ resultStatus: 'revisi', resultId: 'r1' });
+  for (let i = 0; i < 4; i++) await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /<span class="result-status result-revisi">Perlu revisi<\/span>/);
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Perlu revisi<\/dd>/);
+});
+
+test('a result whose file is gone shows a clear message instead of a video, and does not count as a result', async () => {
+  const r1 = resultFor('r9', 's1', 'utama');
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r9.mp4','missing')", context);
+  const p = linkedScene();
+  p.data.videoResults = [r1];
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /File tidak ditemukan\. Unggah ulang video ini sebagai hasil baru\./);
+  assert.equal(/data-result-video="r9"/.test(html), false, 'no broken video is rendered');
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Belum siap<\/dd>/, 'a missing result is not a finished result');
+  assert.match(html, /<dt>Hasil utama<\/dt><dd>belum dipilih<\/dd>/);
+});
+
+test('the storyboard summary counts each scene once and agrees with the status of each scene', async () => {
+  const p = linkedScene();
+  p.data.videoResults = [resultFor('r1', 's1', 'utama')];
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r1.mp4','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const summary = element('#tab-content').innerHTML;
+  assert.match(summary, /<b>Produksi 2 adegan:<\/b> <span>Belum siap 1<\/span> · <span>Siap diproduksi 0<\/span> · <span>Sedang dikerjakan 0<\/span> · <span>Hasil video 1<\/span> · <span>Perlu revisi 0<\/span>/);
+});
+
+test('an older project without results, flow marks, or readiness data still opens and shows empty results', async () => {
+  const p = twoSceneProject();
+  delete p.data.videoResults;
+  for (const s of p.data.scenes) delete s.flowStartedAt;
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /Belum ada hasil video untuk adegan ini\./);
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Belum siap<\/dd>/);
+  assert.deepEqual(JSON.parse(vm.runInContext('JSON.stringify(current.data.videoResults)', context)), []);
+});
+
+test('the storyboard tab and the Flow package explain the manual steps without claiming a video was made', async () => {
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  openStoryboard(context, linkedScene());
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Aplikasi tidak membuat video/);
+  assert.match(html, /Tandai sedang dikerjakan di Flow/);
+  assert.equal(/video sudah dibuat|video dibuat otomatis/i.test(html), false);
+});
+
+// Round 4 (second pass): checklist and saved results must not contradict each other.
+test('a scene marked as generated in the checklist, with no saved file, says the file is not in the app yet', async () => {
+  const p = linkedScene();
+  p.data.checks = { 'scene-s1-generated': true };
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/wajah.png','ok');assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/kopi.png','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /<dt>Checklist<\/dt><dd>Klip dibuat menurut checklist, tetapi file hasil belum tersedia di aplikasi\.<\/dd>/);
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Siap diproduksi<\/dd>/, 'the checklist claim does not change the production status');
+  assert.equal(/Hasil video tersedia/.test(html), false);
+});
+
+test('a checklist claim with a saved and visible file agrees with the production status', async () => {
+  const p = linkedScene();
+  p.data.checks = { 'scene-s1-generated': true };
+  p.data.videoResults = [resultFor('r1', 's1', 'utama')];
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r1.mp4','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Hasil video tersedia<\/dd>/);
+  assert.equal(/belum tersedia di aplikasi|tidak ditemukan di aplikasi/.test(html), false, 'no contradiction is reported');
+});
+
+test('a collected checklist item whose file is missing never reads as saved', async () => {
+  const p = linkedScene();
+  p.data.checks = { 'scene-s1-collected': true };
+  p.data.videoResults = [resultFor('r9', 's1', 'utama')];
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r9.mp4','missing')", context);
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /Checklist &quot;Klip disimpan\/dikumpulkan&quot; dicentang, tetapi file hasil tidak ditemukan di aplikasi\.|Checklist "Klip disimpan\/dikumpulkan" dicentang, tetapi file hasil tidak ditemukan di aplikasi\./);
+  assert.equal(/tersimpan di aplikasi/.test(html.replace(/belum tersimpan di aplikasi|tidak ditemukan di aplikasi/g, '')), false, 'the missing file is not described as saved');
+});
+
+test('a saved file that is not yet ticked in the checklist is reported as a question for the user, not as a conflict', async () => {
+  const p = linkedScene();
+  p.data.videoResults = [resultFor('r1', 's1', 'kandidat')];
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r1.mp4','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneBlock(context, element, 0), /Hasil video tersimpan di aplikasi, tetapi checklist &quot;Klip dibuat di platform eksternal&quot; belum dicentang\.|Hasil video tersimpan di aplikasi, tetapi checklist "Klip dibuat di platform eksternal" belum dicentang\./);
+});
+
+test('the project summary warns about checklist claims without files and explains where the header status comes from', async () => {
+  const p = twoSceneProject();
+  p.data.checks = { 'scene-s1-generated': true, 'scene-s2-collected': true };
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /1 adegan ditandai &quot;Klip dibuat&quot; di checklist, tetapi file hasilnya belum tersimpan di aplikasi\.|1 adegan ditandai "Klip dibuat" di checklist, tetapi file hasilnya belum tersimpan di aplikasi\./);
+  assert.match(html, /1 adegan ditandai "Klip disimpan" di checklist|1 adegan ditandai &quot;Klip disimpan&quot; di checklist/);
+  assert.match(html, /Status di bagian atas proyek berasal dari checklist manual\./);
+});
+
+test('the checklist tab shows, per scene, what the checklist says and what the app actually holds', async () => {
+  const p = twoSceneProject();
+  p.data.checks = { 'scene-s1-generated': true };
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  openStoryboard(context, p);
+  await tick();
+  vm.runInContext("activeTab='checklist';renderProject()", context);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Hasil di aplikasi: belum ada file tersimpan/);
+  assert.match(html, /Klip dibuat menurut checklist, tetapi file hasil belum tersedia di aplikasi\./);
+  assert.match(html, /data-check="scene-s1-generated"/, 'the manual checkbox is still there and unchanged');
+});
+
+test('ticking a manual checklist box does not turn a scene into a finished result', async () => {
+  const p = linkedScene();
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/wajah.png','ok');assetFileState.set('/uploads/ruang.png','ok');assetFileState.set('/uploads/kopi.png','ok')", context);
+  openStoryboard(context, p);
+  await tick();
+  vm.runInContext("updateSceneChecklist(current.data,'scene-s1-generated',true)", context);
+  openStoryboard(context, JSON.parse(vm.runInContext('JSON.stringify(current)', context)));
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /<dt>Status produksi<\/dt><dd>Siap diproduksi<\/dd>/);
+  assert.equal(/Hasil video tersedia/.test(html), false);
+});
+
+test('a missing result cannot be chosen as the main result in the interface', async () => {
+  const p = linkedScene();
+  p.data.videoResults = [resultFor('r9', 's1', 'kandidat')];
+  const { context, element } = appContext({ fetchImpl: videoFetch() });
+  vm.runInContext("assetFileState.set('/uploads/r9.mp4','missing')", context);
+  openStoryboard(context, p);
+  await tick();
+  assert.match(sceneBlock(context, element, 0), /data-result-status="utama" data-result-id="r9" disabled/);
+});
+
+test('the video upload limit is exactly 50 MB: the boundary is accepted and one byte more is refused before sending', async () => {
+  const posts = [];
+  const result = resultFor('r1', 's1', 'kandidat');
+  const { context, change } = appContext({ fetchImpl: videoFetch({ posts, postReply: () => response({ result, videoResults: [result] }) }) });
+  openStoryboard(context, linkedScene());
+  await tick();
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'tepat.mp4', type: 'video/mp4', size: 50_000_000 }] });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(posts.length, 1, 'exactly 50 MB is accepted');
+  change({ dataset: { resultUpload: 's1' }, files: [{ name: 'lebih.mp4', type: 'video/mp4', size: 50_000_001 }] });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(posts.length, 1, 'one byte more is refused without a request');
 });

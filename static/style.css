@@ -56,3 +56,14 @@ button,.primary,.outline,.soft-button,.nav-item,.input,select,input{min-height:4
 .draft-actions>button{flex:1 1 200px}
 input[type=checkbox]{min-height:0;width:20px;height:20px;padding:0;margin-top:2px}
 .entity-panel{margin:18px 0 6px;padding:18px;border:1px solid #e6e9e3;border-radius:14px;background:#fafbf9}.entity-group{margin-top:14px}.entity-group-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.entity-group-head h3{margin:0;font:700 15px var(--ui)}.entity-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:12px;margin-top:10px}.entity-card{border:1px solid #e8ebe5;border-radius:10px;padding:14px;background:#fff}.entity-card label{display:block;margin:10px 0 0;font-size:13px;color:#4e5a53}.entity-card input,.entity-card textarea{display:block;width:100%;margin-top:5px;border:1px solid #e4e8e2;border-radius:7px;padding:10px 11px;font:inherit;font-size:14px;color:#36413b;background:#fff}.entity-top{display:flex;justify-content:space-between;align-items:center}.entity-tag{font-size:12px;letter-spacing:1px;color:#9a7861;font-weight:700}.entity-links .field-label{margin-top:12px}.entity-links select{margin-top:6px}
+.advanced-settings{margin-top:18px;padding:12px 16px;border:1px solid var(--line);border-radius:14px;background:#fafbf9}
+.advanced-settings summary{cursor:pointer;font-weight:600;list-style-position:inside}
+.advanced-body{margin-top:14px}
+.plan-card{margin-top:18px;padding:18px;border:1px solid #cfe0d6;border-radius:14px;background:#f7fbf8}
+.plan-card .pkg-block{margin-top:14px}
+.plan-questions ol{margin:8px 0 12px 20px}
+@media(max-width:640px){.advanced-settings{padding:10px 12px}.plan-card{padding:14px}}
+.plan-notice{margin:12px 0;padding:10px 12px;border-radius:10px;background:#eef6f1;color:#244d45;font-size:14px;line-height:1.5}
+.plan-notice.error{background:#fdeeee;color:#8a2b2b}
+.data-note{margin:12px 0;padding:10px 12px;border-radius:10px;background:#f2f5f1;color:#3f4a44;font-size:14px;line-height:1.55}
+@media(max-width:780px){.idea-layout .side-panel{order:0}}

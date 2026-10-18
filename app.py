@@ -619,8 +619,8 @@ def make_gemini_story(idea, goal, duration, style, details=None):
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise GeminiProviderError(502, str(exc) if isinstance(exc, ValueError) else "Respons Gemini tidak sesuai struktur cerita yang diharapkan.") from None
 
-def make_gemini_understanding(idea, goal, duration, style, details):
-    text = gemini_generate_text(production_package.understanding_prompt(idea, goal, duration, style, details), 3000)
+def make_gemini_understanding(idea, goal, duration, style, details, answers=""):
+    text = gemini_generate_text(production_package.understanding_prompt(idea, goal, duration, style, details, answers), 3000)
     try:
         raw = json.loads(production_package.strip_json_fence(text))
     except json.JSONDecodeError:
@@ -737,7 +737,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not idea or len(idea) > 7000: return self.send(400, '{"error":"Isi ide (maks. 7.000 karakter) sebelum memeriksa pemahaman."}')
                 understanding = make_gemini_understanding(
                     idea, request_text(body, "goal", 100), request_text(body, "duration", 50), request_text(body, "style", 100),
-                    production_package.project_details(body))
+                    production_package.project_details(body), request_text(body, "answers", 1000))
                 return self.send(200, json.dumps({"understanding": understanding}, ensure_ascii=False))
             except production_package.ProductionPackageError as exc:
                 return self.send(400, json.dumps({"error": str(exc)}, ensure_ascii=False))

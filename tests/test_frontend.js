@@ -21,7 +21,13 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
   const confirmMessages = [];
   const makeElement = () => ({
     value: '', textContent: '', innerHTML: '', disabled: false, dataset: {},
-    classList: { add() {}, remove() {}, toggle() {} },
+    classList: {
+      names: new Set(),
+      add(name) { this.names.add(name); },
+      remove(name) { this.names.delete(name); },
+      contains(name) { return this.names.has(name); },
+      toggle(name) { if (this.names.has(name)) this.names.delete(name); else this.names.add(name); },
+    },
     addEventListener() {}, focus() {}, showModal() {}, close() {}, reset() {}, options: [],
     querySelector() { return makeElement(); }, querySelectorAll() { return []; },
     closest() { return null; },
@@ -48,9 +54,9 @@ function appContext({ fetchImpl, storageImpl, projects = [], confirmImpl, clipbo
     fetch, console,
   });
   vm.runInContext(fs.readFileSync(require.resolve('../static/app.js'), 'utf8'), context);
-  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang } = {}) {
+  function click({ id, tab, view, open, deleteAsset, linkAll, copyClip, copyLang, style } = {}) {
     const target = {
-      id, dataset: { deleteAsset, linkAll, copyClip, copyLang },
+      id, dataset: { deleteAsset, linkAll, copyClip, copyLang, style },
       closest(selector) {
         if (selector === '[data-tab]' && tab) return { dataset: { tab } };
         if (selector === '[data-view]' && view) return { dataset: { view } };
@@ -341,7 +347,8 @@ test('manual storyboard generation does not advance when its save fails', async 
   assert.equal(vm.runInContext('activeTab', context), 'idea');
   assert.equal(vm.runInContext('current.data.scenes.length', context), 3);
   assert.equal(JSON.parse(session.get('ai-video-studio:unsaved:p1')).idea, 'Seseorang menanam pohon.');
-  assert.match(element('#toast').textContent, /Penyimpanan gagal/);
+  assert.match(element('#save-state').textContent, /Belum tersimpan — penyimpanan gagal/);
+  assert.equal(element('#toast').textContent, '', 'the failure is shown in the save status, not a toast over the cards');
 });
 
 test('prompt text and copied JSON use the same effective camera and lighting values', () => {
@@ -708,6 +715,7 @@ function packageProject(view, understanding = confirmedUnderstanding()) {
   return p;
 }
 const openPackageTab = (context, p) => vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='package';renderProject()`, context);
+const openIdeaTab = (context, p) => vm.runInContext(`current=${JSON.stringify(p)};projects=[current];activeTab='idea';renderProject()`, context);
 
 test('package tab enables Gemini generation only when the server reports a key', async () => {
   let configured = false;
@@ -867,7 +875,10 @@ test('a failed save keeps the review draft and reports that nothing changed', as
   await tick();
   await click({ id: 'build-package' });
   await click({ id: 'save-package' });
-  assert.match(element('#toast').textContent, /Paket belum tersimpan: Gagal menyimpan paket produksi/);
+  assert.match(element('#tab-content').innerHTML, /plan-notice error" role="status">Paket belum tersimpan: Gagal menyimpan paket produksi/);
+  assert.match(element('#tab-content').innerHTML, /Draf paket di layar ini belum tersimpan/);
+  assert.match(element('#tab-content').innerHTML, /plan-notice error" role="status">[^<]*<\/p><div class="draft-actions"><button class="soft-button" id="discard-package"/, 'the notice sits right above the draft actions');
+  assert.equal(/Paket belum tersimpan/.test(element('#toast').textContent), false, 'the failure is not shown as a toast over the draft');
   assert.notEqual(vm.runInContext('packageDraft', context), null, 'draft stays available for a retry');
   assert.match(element('#tab-content').innerHTML, /Tinjau paket sebelum disimpan/);
   assert.equal(vm.runInContext('current.data.productionPackage', context), undefined);
@@ -931,9 +942,9 @@ test('understanding is requested with the user details, corrected by the user, a
       return response(url === '/api/projects' ? [] : {});
     },
   });
-  openPackageTab(context, p);
+  openIdeaTab(context, p);
   await tick();
-  assert.equal(element('#build-package').disabled, true);
+  assert.ok(element('#build-understanding'), 'the plan button is on the idea tab');
   await click({ id: 'build-understanding' });
   await tick();
   const body = JSON.parse(calls.find(call => call.url === '/api/ai/understanding').options.body);
@@ -950,7 +961,8 @@ test('understanding is requested with the user details, corrected by the user, a
   assert.equal(saved.status, 'confirmed');
   assert.equal(saved.ideaAtConfirm, 'Kopi pagi');
   assert.deepEqual(saved.sequence, ['1. Rani menemukan kucing', '2. Kucing ikut pulang']);
-  assert.match(element('#tab-content').innerHTML, /Pemahaman sudah dikonfirmasi/);
+  assert.match(element('#tab-content').innerHTML, /Rencana sudah Anda setujui/);
+  vm.runInContext("setTab('package')", context);
   await tick();
   assert.equal(element('#build-package').disabled, false);
 });
@@ -976,7 +988,7 @@ test('changing the idea after confirmation asks for a new confirmation before a 
   const { context, element } = appContext();
   openPackageTab(context, packageProject(null, { ...confirmedUnderstanding(), ideaAtConfirm: 'Ide lama' }));
   await tick();
-  assert.match(element('#tab-content').innerHTML, /Ide sudah berubah sejak pemahaman dikonfirmasi/);
+  assert.match(element('#tab-content').innerHTML, /Ide sudah berubah sejak rencana disetujui/);
   assert.equal(element('#build-package').disabled, true);
 });
 
@@ -1085,7 +1097,7 @@ test('the understanding request, the package request, and the target duration al
       return response(url === '/api/projects' ? [] : {});
     },
   });
-  openPackageTab(context, p);
+  openIdeaTab(context, p);
   await tick();
   await click({ id: 'build-understanding' });
   await tick();
@@ -1145,7 +1157,7 @@ test('an AI suggestion is binding only after the user accepts it, and unaccepted
       return response(url === '/api/projects' ? [] : {});
     },
   });
-  openPackageTab(context, p);
+  openIdeaTab(context, p);
   await tick();
   const before = element('#tab-content').innerHTML;
   assert.ok(before.includes('data-accept-suggestion="0"') && before.includes('data-accept-suggestion="1"'));
@@ -1183,21 +1195,312 @@ test('the confirmation shows as confirmed only after the save succeeds, and a fa
       return response(url === '/api/projects' ? [] : {});
     },
   });
-  openPackageTab(context, p);
+  openIdeaTab(context, p);
   await tick();
   await click({ id: 'confirm-understanding' });
   await tick();
   await tick();
-  assert.match(element('#toast').textContent, /belum tersimpan/);
+  assert.match(element('#tab-content').innerHTML, /plan-notice error" role="status">Pemahaman belum tersimpan/);
+  assert.equal(element('#toast').textContent, '', 'no toast over the plan card');
   assert.equal(vm.runInContext('current.data.understanding.status', context), 'draft');
   const failed = element('#tab-content').innerHTML;
   assert.equal(failed.includes('Pemahaman sudah dikonfirmasi'), false);
   assert.ok(failed.includes('id="confirm-understanding"'));
+  vm.runInContext("setTab('package')", context);
+  await tick();
   assert.equal(element('#build-package').disabled, true, 'the package stays blocked');
+  vm.runInContext("setTab('idea')", context);
+  await tick();
   saveWorks = true;
   await click({ id: 'confirm-understanding' });
   await tick();
   assert.equal(vm.runInContext('current.data.understanding.status', context), 'confirmed');
-  assert.match(element('#tab-content').innerHTML, /Pemahaman sudah dikonfirmasi/);
+  assert.match(element('#tab-content').innerHTML, /Rencana sudah Anda setujui/);
   assert.equal(puts[puts.length - 1].data.understanding.status, 'confirmed');
+});
+
+// Simple plan flow: one idea box, one plan button, a reviewable plan, and folded advanced settings.
+const planFetch = ({ configured = true, record = [], understanding = null, projects = [] } = {}) => async (url, options) => {
+  record.push({ url, options });
+  if (url === '/api/ai/gemini/status') return response({ configured });
+  if (url === '/api/ai/understanding') return response({ understanding });
+  if (options?.method === 'PUT') return response(JSON.parse(options.body));
+  return response(url === '/api/projects' ? projects : {});
+};
+const reviewablePlan = (overrides = {}) => ({
+  status: 'draft', core: 'Ibu mencari alamat anaknya.', message: '', characters: ['Ibu Sari — ibu tua'], locations: ['Kota seberang — sore hujan'],
+  sequence: ['1. Ibu menemukan surat'], unclear: [], suggestions: [], acceptedSuggestions: [],
+  goal: 'Cerita pendek hangat', recommendedStyle: 'Ilustrasi hangat', camera: ['medium shot'], assetsNeeded: ['foto Ibu Sari'], questions: [], ...overrides,
+});
+
+test('the idea tab leads with one input and one plan button, and the other settings start folded away', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.ok(html.includes('Buat Rencana Produksi'));
+  const details = html.indexOf('<details class="advanced-settings">');
+  assert.ok(details > html.indexOf('id="idea-input"'), 'settings come after the idea box');
+  assert.equal(html.includes('<details class="advanced-settings" open'), false, 'settings start folded');
+  for (const id of ['goal-input', 'duration-input', 'style-input', 'character-input', 'world-input', 'message-input', 'ai-provider', 'draft-story']) {
+    assert.ok(html.indexOf(`id="${id}"`) > details, `${id} sits inside the folded settings`);
+  }
+});
+
+test('the plan button stays disabled and explains the missing key when Gemini is not configured', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch({ configured: false }) });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  await tick();
+  assert.equal(element('#build-understanding').disabled, true);
+  assert.match(element('#plan-status').textContent, /GEMINI_API_KEY belum terbaca/);
+});
+
+test('a new plan is shown on the idea tab right after it is made, without switching tabs', async () => {
+  const calls = [];
+  const { context, element, click } = appContext({ fetchImpl: planFetch({ record: calls, understanding: reviewablePlan() }), confirmImpl: () => true });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  assert.equal(calls.filter(call => call.url === '/api/ai/understanding').length, 1);
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /id="plan-review"/);
+  assert.match(html, /RENCANA PRODUKSI · PERIKSA DULU/);
+  assert.ok(html.includes('id="confirm-understanding"'));
+  assert.equal(calls.some(call => call.url === '/api/ai/production'), false, 'no package before approval');
+});
+
+test('the plan shows the AI recommendation for style, camera, assets and questions, and the user can take the recommended style', async () => {
+  const p = packageProject(null, reviewablePlan({ questions: ['Siapa nama anak dalam surat?'] }));
+  const { context, element, click } = appContext({ fetchImpl: planFetch() });
+  openIdeaTab(context, p);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  for (const text of ['Ilustrasi hangat', 'medium shot', 'foto Ibu Sari', 'Siapa nama anak dalam surat?', 'id="answer-questions"', 'id="confirm-understanding"']) {
+    assert.ok(html.includes(text), `missing: ${text}`);
+  }
+  assert.equal(vm.runInContext('current.data.style', context) === 'Ilustrasi hangat', false, 'the style is not taken without the user');
+  await click({ id: 'use-recommended-style', style: 'Ilustrasi hangat' });
+  await tick();
+  assert.equal(vm.runInContext('current.data.style', context), 'Ilustrasi hangat');
+  assert.equal(vm.runInContext('current.data.understanding.status', context), 'draft', 'taking a style does not approve the plan');
+});
+
+test('answering the AI questions sends the answer with the request, and an empty answer is never sent', async () => {
+  const calls = [];
+  const { context, element, click } = appContext({ fetchImpl: planFetch({ record: calls, understanding: reviewablePlan() }), confirmImpl: () => true });
+  openIdeaTab(context, packageProject(null, reviewablePlan({ questions: ['Siapa nama anak dalam surat?'] })));
+  await tick();
+  element('#plan-answers').value = '';
+  await click({ id: 'answer-questions' });
+  await tick();
+  assert.equal(calls.some(call => call.url === '/api/ai/understanding'), false, 'an empty answer is not sent');
+  element('#plan-answers').value = 'Anaknya bernama Dimas';
+  await click({ id: 'answer-questions' });
+  await tick();
+  await tick();
+  const body = JSON.parse(calls.find(call => call.url === '/api/ai/understanding').options.body);
+  assert.equal(body.answers, 'Anaknya bernama Dimas');
+  assert.equal(body.idea, 'Kopi pagi');
+});
+
+test('the package tab shows the plan status and links back to the idea tab instead of repeating the editor', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openPackageTab(context, packageProject(null, null));
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.ok(html.includes('Belum ada rencana'));
+  assert.ok(html.includes('data-tab="idea"'));
+  assert.equal(html.includes('data-understanding-field'), false, 'the plan editor lives on the idea tab only');
+  assert.equal(html.includes('id="build-understanding"'), false);
+});
+
+test('the prompt tab points to the package prompts once a package is saved', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  vm.runInContext("setTab('prompt')", context);
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /Prompt per klip dari paket produksi ada di tab/);
+});
+
+test('the plan result message sits inside the plan area and the floating toast stays silent', async () => {
+  const { context, element, click } = appContext({ fetchImpl: planFetch({ understanding: reviewablePlan() }), confirmImpl: () => true });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /class="plan-notice ok" role="status">Rencana dibuat/);
+  assert.equal(element('#toast').textContent, '', 'no toast covers the plan card');
+});
+
+test('a failed plan request shows its reason inside the plan area, not as a toast', async () => {
+  const fetchImpl = async (url) => {
+    if (url === '/api/ai/gemini/status') return response({ configured: true });
+    if (url === '/api/ai/understanding') return { ok: false, status: 502, json: async () => ({ error: 'Gemini tidak merespons' }) };
+    return response(url === '/api/projects' ? [] : {});
+  };
+  const { context, element, click } = appContext({ fetchImpl });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /class="plan-notice error" role="status">Gemini tidak merespons/);
+  assert.equal(element('#toast').textContent, '');
+});
+
+test('the advanced settings keep the open or folded state the user chose when the tab is redrawn', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  assert.equal(element('#tab-content').innerHTML.includes('<details class="advanced-settings" open'), false, 'folded by default');
+  vm.runInContext('advancedSettingsOpen = true; renderProject()', context);
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /<details class="advanced-settings" open/);
+  vm.runInContext("setTab('package')", context);
+  vm.runInContext("setTab('idea')", context);
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /<details class="advanced-settings" open/, 'still open after switching tabs');
+});
+
+test('a plan message does not follow the user into another project', async () => {
+  const pA = packageProject(null, null);
+  const pB = { ...project('p2'), idea: 'Ide proyek lain' };
+  const { context, element, click } = appContext({ fetchImpl: planFetch({ understanding: reviewablePlan(), projects: [pA, pB] }), confirmImpl: () => true, projects: [pA, pB] });
+  openIdeaTab(context, pA);
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /plan-notice ok/);
+  vm.runInContext("openProject('p2')", context);
+  await tick();
+  assert.equal(element('#tab-content').innerHTML.includes('plan-notice'), false, 'the other project shows no plan message');
+  vm.runInContext("openProject('p1')", context);
+  await tick();
+  assert.equal(element('#tab-content').innerHTML.includes('plan-notice'), false, 'returning does not revive a stale message');
+});
+
+test('a plan that finishes after the user switched projects is not shown in the new project', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fetchImpl = async (url, options) => {
+    if (url === '/api/ai/gemini/status') return response({ configured: true });
+    if (url === '/api/ai/understanding') { await gate; return response({ understanding: reviewablePlan() }); }
+    if (options?.method === 'PUT') return response(JSON.parse(options.body));
+    return response(url === '/api/projects' ? [pA, pB] : {});
+  };
+  const pA = packageProject(null, null);
+  const pB = { ...project('p2'), idea: 'Ide proyek lain' };
+  const { context, element, click } = appContext({ fetchImpl, confirmImpl: () => true, projects: [pA, pB] });
+  openIdeaTab(context, pA);
+  await tick();
+  const pending = click({ id: 'build-understanding' });
+  await tick();
+  vm.runInContext("openProject('p2')", context);
+  await tick();
+  release();
+  await pending;
+  await tick();
+  await tick();
+  assert.equal(element('#tab-content').innerHTML.includes('plan-notice'), false, 'the late result is not announced in the new project');
+  assert.equal(vm.runInContext("current.id", context), 'p2');
+});
+
+test('when saving the plan fails, the message says it is not saved and never claims the plan was created', async () => {
+  let saveWorks = false;
+  const fetchImpl = async (url, options) => {
+    if (url === '/api/ai/gemini/status') return response({ configured: true });
+    if (url === '/api/ai/understanding') return response({ understanding: reviewablePlan() });
+    if (options?.method === 'PUT') {
+      if (!saveWorks) return { ok: false, status: 500, json: async () => ({ error: 'Gagal menyimpan' }) };
+      return response(JSON.parse(options.body));
+    }
+    return response(url === '/api/projects' ? [] : {});
+  };
+  const { context, element, click } = appContext({ fetchImpl, confirmImpl: () => true });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /plan-notice error/);
+  assert.match(html, /belum tersimpan/);
+  assert.equal(html.includes('plan-notice ok'), false, 'no success message on a failed save');
+  assert.match(element('#project-content').innerHTML, /id="retry-save"/, 'the retry action stays available after a failed save');
+  saveWorks = true;
+  await click({ id: 'build-understanding' });
+  await tick();
+  await tick();
+  assert.match(element('#tab-content').innerHTML, /plan-notice ok/, 'a later successful save shows success');
+});
+
+test('a plan that fails after the user switched projects does not show its error in the new project', async () => {
+  let fail;
+  const gate = new Promise(resolve => { fail = resolve; });
+  const fetchImpl = async (url, options) => {
+    if (url === '/api/ai/gemini/status') return response({ configured: true });
+    if (url === '/api/ai/understanding') { await gate; return { ok: false, status: 502, json: async () => ({ error: 'Gemini tidak merespons' }) }; }
+    if (options?.method === 'PUT') return response(JSON.parse(options.body));
+    return response(url === '/api/projects' ? [pA, pB] : {});
+  };
+  const pA = packageProject(null, null);
+  const pB = { ...project('p2'), idea: 'Ide proyek lain' };
+  const { context, element, click } = appContext({ fetchImpl, confirmImpl: () => true, projects: [pA, pB] });
+  openIdeaTab(context, pA);
+  await tick();
+  const pending = click({ id: 'build-understanding' });
+  await tick();
+  vm.runInContext("openProject('p2')", context);
+  await tick();
+  fail();
+  await pending;
+  await tick();
+  assert.equal(element('#tab-content').innerHTML.includes('Gemini tidak merespons'), false, 'the other project does not show the error');
+  assert.equal(vm.runInContext("current.id", context), 'p2');
+});
+
+test('the idea tab says what leaves the app for Gemini, and the package tab says what the upload sends', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  const idea = element('#tab-content').innerHTML;
+  assert.match(idea, /Apa yang dikirim ke Gemini\?/);
+  assert.match(idea, /Saat membuat rencana: ide, jenis video, durasi/);
+  assert.match(idea, /Draft cerita mengirim hal yang sama tanpa jawaban/);
+  assert.match(idea, /Gambar dan nama file tidak dikirim/);
+  assert.ok(idea.indexOf('Apa yang dikirim ke Gemini?') < idea.indexOf('id="idea-input"'), 'the one-line summary sits above the idea box, visible on a phone');
+  assert.ok(idea.indexOf('Saat membuat rencana') < idea.indexOf('<details class="advanced-settings"'), 'the details text is not buried in the folded settings');
+  assert.match(idea, /class="studio-layout idea-layout"/);
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  const pkg = element('#tab-content').innerHTML;
+  assert.match(pkg, /hanya id dan jenisnya yang dikirim; isi gambar dan nama file tidak/);
+  assert.match(pkg, /Prompt dari paket produksi tersimpan\./);
+});
+
+test('the prompt tab names its source, and the storyboard prompts stay available', async () => {
+  const { context, element, click } = appContext({ fetchImpl: planFetch() });
+  openPackageTab(context, packageProject(savedView(samplePackage())));
+  await tick();
+  vm.runInContext("setTab('prompt')", context);
+  await tick();
+  const html = element('#tab-content').innerHTML;
+  assert.match(html, /Sumber prompt ini: adegan di tab Storyboard/);
+  assert.match(html, /Prompt per klip dari paket produksi ada di tab/);
+  assert.ok(html.includes('id="copy-prompt"'), 'the storyboard prompt and copy action are kept');
+});
+
+test('an in-card notice hides a floating toast that is still on screen', async () => {
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openIdeaTab(context, packageProject(null, null));
+  await tick();
+  element('#toast').classList.add('show');
+  vm.runInContext("setPlanNotice('error', 'Contoh')", context);
+  assert.equal(element('#toast').classList.contains('show'), false, 'the toast no longer covers the card');
 });

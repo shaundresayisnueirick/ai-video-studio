@@ -79,7 +79,44 @@ class DetailsAndUnderstandingTests(unittest.TestCase):
 
     def test_valid_understanding_is_returned_unchanged(self):
         value = json.loads(understanding_reply())
-        self.assertEqual(pp.validate_understanding(value), {**value, "acceptedSuggestions": []})
+        self.assertEqual(pp.validate_understanding(value), {
+            **value, "acceptedSuggestions": [], "goal": "", "recommendedStyle": "", "camera": [], "assetsNeeded": [], "questions": [],
+        })
+
+    def test_plan_fields_are_normalized_and_an_unknown_style_is_dropped(self):
+        value = json.loads(understanding_reply())
+        value.update({
+            "goal": "Iklan kopi pagi", "recommended_style": "Animasi 3D", "camera": ["close-up tangan"],
+            "assets_needed": ["foto produk"], "questions": ["Siapa tokoh utamanya?"],
+        })
+        normalized = pp.validate_understanding(value)
+        self.assertEqual(normalized["goal"], "Iklan kopi pagi")
+        self.assertEqual(normalized["recommendedStyle"], "Animasi 3D")
+        self.assertEqual(normalized["camera"], ["close-up tangan"])
+        self.assertEqual(normalized["assetsNeeded"], ["foto produk"])
+        self.assertEqual(normalized["questions"], ["Siapa tokoh utamanya?"])
+        value["recommended_style"] = "Gaya bebas buatan AI"
+        self.assertEqual(pp.validate_understanding(value)["recommendedStyle"], "")
+
+    def test_more_than_three_questions_are_refused_not_cut(self):
+        value = json.loads(understanding_reply())
+        value["questions"] = ["a?", "b?", "c?", "d?"]
+        with self.assertRaises(pp.ProductionPackageError) as context:
+            pp.validate_understanding(value)
+        self.assertIn("maksimal 3", str(context.exception))
+
+    def test_understanding_prompt_carries_answers_and_limits_questions(self):
+        prompt = pp.understanding_prompt("Rani menolong kucing", "Cerita", "1 menit", "Sinematik natural", {}, "Tokohnya ibu tua")
+        self.assertIn("Tokohnya ibu tua", prompt)
+        self.assertIn("paling banyak 3 pertanyaan", prompt)
+        self.assertNotIn("Jawaban pengguna", pp.understanding_prompt("Rani menolong kucing", "Cerita", "1 menit", "Sinematik natural", {}))
+
+    def test_confirmed_plan_fields_reach_the_package_prompt_only_after_confirmation(self):
+        confirmed = {**CONFIRMED_UNDERSTANDING, "goal": "Iklan kopi", "camera": ["close-up"], "assetsNeeded": ["foto produk"]}
+        block = pp.understanding_block(confirmed)
+        self.assertIn('"goal": "Iklan kopi"', block)
+        self.assertIn('"camera"', block)
+        self.assertIn('"assets_needed"', block)
 
     def test_confirmation_is_required_and_tied_to_the_saved_idea(self):
         with self.assertRaises(pp.ProductionPackageError) as context:
@@ -331,3 +368,12 @@ class SuggestionDecisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssetDisclosureTests(unittest.TestCase):
+    def test_package_prompt_sends_asset_id_and_type_but_never_the_file_name(self):
+        assets = [{"id": "a1", "name": "rahasia-wajah.png", "type": "Karakter"}]
+        prompt = pp.package_prompt("Rani menolong kucing", "Cerita", "1 menit", "Sinematik natural", assets,
+                                   pp.model_limits("flow-default"), {}, CONFIRMED_UNDERSTANDING)
+        self.assertIn("id: a1 | jenis: Karakter", prompt)
+        self.assertNotIn("rahasia-wajah", prompt)

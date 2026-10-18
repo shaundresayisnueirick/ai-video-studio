@@ -19,6 +19,9 @@ MAX_ID_CHARS = 64
 MAX_DETAIL_CHARS = 2000
 MAX_UNDERSTANDING_ITEMS = 40
 MAX_UNDERSTANDING_ITEM_CHARS = 300
+MAX_QUESTIONS = 3
+# Styles the AI may recommend. Matches the style choices offered in the app, minus the 'let me decide later' option.
+RECOMMENDABLE_STYLES = ("Sinematik natural", "Animasi 3D", "Ilustrasi hangat", "Dokumenter", "Iklan bersih")
 REFERENCE_ROLES = ("karakter", "produk", "lokasi", "gaya", "bingkai_awal")
 AUDIO_PLANS = ("tanpa_audio", "dialog", "narasi", "musik", "efek")
 ASSET_TYPES = ("Karakter", "Lokasi", "Produk", "Adegan", "Referensi umum")
@@ -37,6 +40,8 @@ EN_DETAIL_KEYS = ("action", "camera", "lighting", "audio_text")
 # Fields the user types on the Ide form. They are sent to Gemini as they are.
 DETAIL_FIELDS = (("message", "Pesan utama"), ("character", "Tokoh dan tampilannya"), ("world", "Lokasi dan suasana"))
 UNDERSTANDING_LISTS = ("characters", "locations", "sequence", "unclear", "suggestions")
+# Plan lists the user reviews before confirming. Stored under camelCase keys.
+PLAN_LISTS = (("camera", "camera"), ("assets_needed", "assetsNeeded"))
 
 FIDELITY_RULES = (
     "Aturan kesetiaan (wajib dipatuhi):\n"
@@ -220,6 +225,9 @@ def understanding_block(understanding):
         "locations": understanding.get("locations", []),
         "sequence": understanding.get("sequence", []),
         "unclear": understanding.get("unclear", []),
+        "goal": understanding.get("goal", ""),
+        "camera": understanding.get("camera", []),
+        "assets_needed": understanding.get("assetsNeeded", []),
         "accepted_suggestions": understanding.get("acceptedSuggestions", []),
     }
     return (
@@ -250,10 +258,15 @@ UNDERSTANDING_EXAMPLE = {
     "sequence": ["1. kejadian pertama", "2. kejadian berikutnya"],
     "unclear": ["hal yang belum jelas dan perlu keputusan pengguna"],
     "suggestions": ["tambahan kreatif yang tidak ada di ide atau detail pengguna"],
+    "goal": "tujuan video dalam satu kalimat",
+    "recommended_style": "satu gaya dari daftar: " + ", ".join(RECOMMENDABLE_STYLES),
+    "camera": ["saran sudut dan gerak kamera yang cocok"],
+    "assets_needed": ["gambar yang sebaiknya diunggah, misalnya wajah tokoh atau produk"],
+    "questions": [],
 }
 
 
-def understanding_prompt(idea, goal, duration, style, details):
+def understanding_prompt(idea, goal, duration, style, details, answers=""):
     """Ask only for a summary of what the user meant. No package, clip, or prompt is requested here."""
     return (
         "Tugas Anda hanya memahami ide pengguna. Jangan membuat paket produksi, klip, atau prompt.\n"
@@ -267,6 +280,10 @@ def understanding_prompt(idea, goal, duration, style, details):
         + f"Gaya visual: {_flat(style) or 'belum ditentukan'}\n"
         + f"Ide pengguna: {idea}\n"
         + details_block(details)
+        + "Rencana: isi 'goal', 'recommended_style', 'camera', dan 'assets_needed' sebagai saran yang masih bisa diubah pengguna. "
+        "Jika informasi penting untuk membuat rencana benar-benar kurang (misalnya tokoh utama atau produk), isi 'questions' dengan paling banyak "
+        f"{MAX_QUESTIONS} pertanyaan singkat dalam bahasa Indonesia. Jika cukup, biarkan 'questions' kosong dan jangan bertanya.\n"
+        + (f"Jawaban pengguna atas pertanyaan sebelumnya (sumber utama, wajib dipakai):\n{answers.strip()}\n" if answers.strip() else "")
     )
 
 
@@ -278,6 +295,19 @@ def validate_understanding(raw):
         "core": _text(raw.get("core"), "Inti cerita", MAX_CONCEPT_CHARS),
         "message": _text(raw.get("message"), "Pesan utama", MAX_TEXT_CHARS, required=False),
     }
+    normalized["goal"] = _text(raw.get("goal"), "Tujuan video", MAX_TEXT_CHARS, required=False)
+    style = _text(raw.get("recommended_style"), "Gaya rekomendasi", 100, required=False)
+    # An unknown style is dropped, not guessed. The user can still pick any style in the form.
+    normalized["recommendedStyle"] = style if style in RECOMMENDABLE_STYLES else ""
+    for raw_key, key in PLAN_LISTS:
+        items = _list(raw.get(raw_key), f"Bagian {raw_key}")
+        if len(items) > MAX_UNDERSTANDING_ITEMS:
+            raise ProductionPackageError(f"Bagian {raw_key} memuat {len(items)} butir; maksimal {MAX_UNDERSTANDING_ITEMS}. Ringkas dahulu.")
+        normalized[key] = [_text(item, f"Butir {raw_key} nomor {position}", MAX_UNDERSTANDING_ITEM_CHARS) for position, item in enumerate(items, 1)]
+    questions = _list(raw.get("questions"), "Pertanyaan")
+    if len(questions) > MAX_QUESTIONS:
+        raise ProductionPackageError(f"Pertanyaan memuat {len(questions)} butir; maksimal {MAX_QUESTIONS}. Ringkas dahulu.")
+    normalized["questions"] = [_text(item, f"Pertanyaan nomor {position}", MAX_UNDERSTANDING_ITEM_CHARS) for position, item in enumerate(questions, 1)]
     for key in UNDERSTANDING_LISTS:
         items = _list(raw.get(key), f"Bagian {key}")
         if len(items) > MAX_UNDERSTANDING_ITEMS:

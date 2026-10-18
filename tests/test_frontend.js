@@ -1996,6 +1996,24 @@ test('the video prompt describes motion and camera, is kept separate from the im
   assert.equal(vm.runInContext("'video:s1' in current.data.visualPrompts", context), false, 'restoring removes the edit');
 });
 
+test('a Gemini production clip is mapped manually and contributes to one final scene prompt', async () => {
+  const p = twoSceneProject();
+  p.data.productionPackage = savedView(samplePackage());
+  p.data.scenes[0].productionClipIndex = 2;
+  const { context, element } = appContext({ fetchImpl: planFetch() });
+  openStoryboard(context, p);
+  await tick();
+  const html = sceneBlock(context, element, 0);
+  assert.match(html, /data-gemini-clip="s1"/);
+  assert.match(html, /value="2" selected/);
+  const prompt = vm.runInContext("sceneVideoPromptDefault(current.data.scenes[0], current.data)", context);
+  assert.match(prompt, /Arahan inti dari paket produksi Gemini \\(klip 2\\): Tangan menuang kopi, uap naik\\./);
+  assert.match(prompt, /Jika arahan inti ini berbeda dengan detail storyboard di bawah, ikuti detail storyboard sebagai keputusan final\\./);
+  assert.match(prompt, /Aksi utama: Rani membuka pintu/);
+  assert.match(prompt, /Durasi klip: 5 detik/);
+  assert.equal(prompt.includes('Arahan inti dari paket produksi Gemini (klip 1)'), false);
+});
+
 test('the Google Flow package lists only the references linked to that scene, with their availability', async () => {
   const p = twoSceneProject();
   p.data.assets = [
